@@ -1,0 +1,188 @@
+{
+  "design_identity": {
+    "persona": "E1 - The Anti-AI Designer",
+    "theme_mode": "dark",
+    "archetype": "The Performance Pro",
+    "emotional_vibe": "Tactical, Precision, High-Velocity, Institutional",
+    "core_principles": [
+      "Density is Information: Don't hide data, structure it beautifully.",
+      "Color is Signal: 95% Monochrome, 5% Signal (Buy/Sell/Alert).",
+      "Motion is Feedback: Animations should feel like mechanical switches, not floaty clouds."
+    ]
+  },
+  "typography": {
+    "font_family_headings": "Manrope",
+    "font_family_body": "IBM Plex Sans",
+    "font_family_mono": "JetBrains Mono",
+    "scale": {
+      "h1": "text-4xl md:text-5xl font-bold tracking-tight",
+      "h2": "text-3xl font-semibold tracking-tight",
+      "h3": "text-xl font-medium tracking-tight uppercase text-muted-foreground",
+      "body": "text-sm leading-relaxed",
+      "data_value": "font-mono text-lg font-bold tracking-tight",
+      "data_label": "text-xs font-medium text-muted-foreground uppercase tracking-wider"
+    },
+    "installation_instructions": "Import fonts via Google Fonts in index.css: @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;600;700;800&display=swap');"
+  },
+  "colors": {
+    "palette": {
+      "background": "#050505",
+      "surface_primary": "#0A0A0A",
+      "surface_secondary": "#121212",
+      "border_subtle": "#27272A",
+      "border_active": "#3F3F46",
+      "text_primary": "#EDEDED",
+      "text_secondary": "#A1A1AA",
+      "accent_primary": "#EDEDED",
+      "signal_success": "#00FF94",
+      "signal_danger": "#FF3B30",
+      "signal_warning": "#FFCC00",
+      "ai_glow": "#7000FF"
+    },
+    "gradients": {
+      "hero_glow": "radial-gradient(circle at center, rgba(112, 0, 255, 0.15) 0%, rgba(0, 0, 0, 0) 70%)",
+      "profit_glow": "linear-gradient(180deg, rgba(0, 255, 148, 0.1) 0%, rgba(0, 0, 0, 0) 100%)"
+    },
+    "usage_rules": [
+      "Never use solid backgrounds for cards; use #0A0A0A with a 1px border (#27272A).",
+      "Green (#00FF94) is ONLY for positive P&L and 'Buy' signals.",
+      "Red (#FF3B30) is ONLY for negative P&L and 'Sell' signals.",
+      "Purple (#7000FF) is reserved EXCLUSIVELY for AI Analysis/Insights."
+    ]
+  },
+  "layout": {
+    "grid_system": "Bento Grid - Mode B (High Density)",
+    "container_max_width": "max-w-[1600px]",
+    "spacing": {
+      "page_padding": "p-4 md:p-6 lg:p-8",
+      "card_padding": "p-5",
+      "gap": "gap-4 md:gap-6"
+    },
+    "structure": {
+      "dashboard_grid": "grid grid-cols-1 md:grid-cols-12 gap-4",
+      "sidebar_width": "w-64"
+    },
+    "z_index": {
+      "toast": 100,
+      "modal": 50,
+      "dropdown": 40,
+      "sticky_header": 30
+    }
+  },
+  "components": {
+    "buttons": {
+      "primary": "bg-primary text-primary-foreground hover:bg-primary/90 rounded-sm h-10 px-4 font-medium uppercase tracking-wide text-xs",
+      "secondary": "bg-transparent border border-border hover:bg-secondary/50 text-secondary-foreground rounded-sm h-10 px-4 text-xs",
+      "destructive": "bg-red-900/20 text-red-400 border border-red-900/50 hover:bg-red-900/30",
+      "trade_buy": "bg-[#00FF94] text-black hover:bg-[#00CC76] font-bold uppercase tracking-widest",
+      "trade_sell": "bg-[#FF3B30] text-white hover:bg-[#CC2F26] font-bold uppercase tracking-widest"
+    },
+    "cards": {
+      "default": "bg-[#0A0A0A] border border-border/40 rounded-lg shadow-none",
+      "interactive": "hover:border-primary/50 transition-colors duration-200 cursor-pointer",
+      "glass": "bg-black/60 backdrop-blur-xl border border-white/10"
+    },
+    "inputs": {
+      "default": "bg-[#121212] border-border/50 focus:border-primary focus:ring-1 focus:ring-primary rounded-md h-10 text-sm placeholder:text-muted-foreground/50"
+    },
+    "badges": {
+      "sector": "border border-border bg-secondary/20 text-secondary-foreground text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full",
+      "sentiment_bullish": "bg-green-500/10 text-green-400 border border-green-500/20",
+      "sentiment_bearish": "bg-red-500/10 text-red-400 border border-red-500/20"
+    }
+  },
+  "visual_enhancers": {
+    "borders": {
+      "tech": "1px solid rgba(255, 255, 255, 0.08)",
+      "active": "1px solid rgba(255, 255, 255, 0.2)"
+    },
+    "shadows": {
+      "glow": "0 0 20px -5px rgba(0, 255, 148, 0.15)",
+      "ambient": "0 4px 24px -2px rgba(0, 0, 0, 0.5)"
+    },
+    "effects": {
+      "scanline": "background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0,0,0,0.2) 50%, rgba(0,0,0,0.2)); background-size: 100% 4px;",
+      "noise": "url(\"data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.05'/%3E%3C/svg%3E\")"
+    }
+  },
+  "media": {
+    "icons_library": "lucide-react",
+    "images": [
+      {
+        "category": "hero_background",
+        "url": "https://images.unsplash.com/photo-1771226281112-b7119ef4112e?crop=entropy&cs=srgb&fm=jpg&q=85",
+        "description": "Abstract dark wavy lines for login/hero background",
+        "css_treatment": "opacity-30 grayscale mix-blend-screen"
+      },
+      {
+        "category": "ai_research_concept",
+        "url": "https://images.pexels.com/photos/6203470/pexels-photo-6203470.jpeg?auto=compress&cs=tinysrgb&h=650&w=940",
+        "description": "Neon blue line chart for AI analysis section empty state",
+        "css_treatment": "rounded-lg border border-border/50 opacity-80"
+      }
+    ]
+  },
+  "motion": {
+    "libraries": ["framer-motion"],
+    "definitions": {
+      "page_transition": {
+        "initial": { "opacity": 0, "y": 10 },
+        "animate": { "opacity": 1, "y": 0 },
+        "exit": { "opacity": 0, "y": -10 },
+        "transition": { "duration": 0.3, "ease": "easeOut" }
+      },
+      "card_hover": {
+        "scale": 1.01,
+        "borderColor": "rgba(255, 255, 255, 0.2)",
+        "transition": { "duration": 0.2 }
+      },
+      "list_stagger": {
+        "container": {
+          "hidden": { "opacity": 0 },
+          "show": {
+            "opacity": 1,
+            "transition": { "staggerChildren": 0.05 }
+          }
+        },
+        "item": {
+          "hidden": { "opacity": 0, "x": -10 },
+          "show": { "opacity": 1, "x": 0 }
+        }
+      }
+    }
+  },
+  "accessibility": {
+    "contrast_check": "Ensure #A1A1AA text on #050505 background meets 4.5:1. If not, lighten text to #D4D4D8.",
+    "interactive_elements": "All buttons must have :focus-visible outlines (ring-2 ring-primary).",
+    "screen_readers": "Use aria-label on icon-only buttons (e.g., 'Approve Trade')."
+  },
+  "universal_guidelines": [
+    "You tend to converge toward generic, 'on distribution' outputs. In frontend design, this creates what users call the 'AI slop' aesthetic. Avoid this: make creative, distinctive frontends that surprise and delight.",
+    "Dark colors look good when used independently without gradients. DO NOT use dark colors as gradients.",
+    "Don't make generic centered layouts, simplistic gradients, and uniform styling.",
+    "Create depth through layered design elements with z-index hierarchy.",
+    "Use glass-morphism effects with backdrop filters (12-24px blur).",
+    "You MUST NOT apply universal transition. Eg: transition: all. This results in breaking transforms. Always add transitions for specific interactive elements like button, input excluding transforms.",
+    "You MUST NOT center align the app container, ie do not add .App { text-align: center; } in the css file. This disrupts the human natural reading flow of text.",
+    "Always use modern button styles like pill-shaped, or sharp button with interaction animations & color relevant to the app style.",
+    "NEVER: use AI assistant Emoji characters like 🤖🧠💭 etc for icons.",
+    "Every interaction needs micro-animations - hover states, transitions, parallax effects, and entrance animations. Static = dead.",
+    "Use 2-3x more spacing than feels comfortable. Cramped designs look cheap.",
+    "Subtle grain textures, noise overlays, custom cursors, selection states, and loading animations: separates good from extraordinary.",
+    "Main agent relies on these image URLs. Missing categories = main agent will use placeholder text which is FORBIDDEN.",
+    "Prioritize using pre-existing components from src/components/ui when applicable.",
+    "Components MUST use named exports (export const ComponentName = ...).",
+    "Pages MUST use default exports (export default function PageName() {...}).",
+    "Use 'sonner' for toasts.",
+    "All interactive and key informational elements MUST include a data-testid attribute."
+  ],
+  "instructions_to_main_agent": [
+    "Install 'framer-motion' and 'recharts' if not present.",
+    "Update 'tailwind.config.js' with the new color palette extension.",
+    "Create a 'Layout' component that applies the sidebar + header structure globally.",
+    "For the 'Sector-wise Stock Bucket', use a masonry or dense grid layout, not a simple list.",
+    "The 'AI Research Panel' should feel like a distinct 'app-within-an-app' using the purple accent color.",
+    "Use Recharts for the Portfolio P&L chart (AreaChart with gradient fill).",
+    "Implement the 'Approve/Reject' workflow with 'Sonner' toast notifications for feedback."
+  ]
+}
