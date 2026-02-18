@@ -1,34 +1,277 @@
-.App-logo {
-    height: 40vmin;
-    pointer-events: none;
-}
-
-@media (prefers-reduced-motion: no-preference) {
-    .App-logo {
-        animation: App-logo-spin infinite 20s linear;
-    }
-}
-
-.App-header {
-    background-color: #0f0f10;
+/* Main app container - no center alignment */
+.App {
     min-height: 100vh;
+    background-color: #050505;
+}
+
+/* Sidebar styles */
+.sidebar {
+    width: 240px;
+    background-color: #0A0A0A;
+    border-right: 1px solid #27272A;
+    height: 100vh;
+    position: fixed;
+    left: 0;
+    top: 0;
+    overflow-y: auto;
+}
+
+.sidebar-item {
+    padding: 12px 16px;
     display: flex;
-    flex-direction: column;
     align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
+    gap: 12px;
+    color: #A1A1AA;
+    font-size: 0.875rem;
+    font-weight: 500;
+    border-radius: 6px;
+    margin: 4px 8px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
 }
 
-.App-link {
-    color: #61dafb;
+.sidebar-item:hover {
+    background-color: #121212;
+    color: #EDEDED;
 }
 
-@keyframes App-logo-spin {
-    from {
-        transform: rotate(0deg);
+.sidebar-item.active {
+    background-color: #121212;
+    color: #EDEDED;
+    border-left: 2px solid #00FF94;
+}
+
+/* Main content area */
+.main-content {
+    margin-left: 240px;
+    padding: 24px 32px;
+    min-height: 100vh;
+}
+
+/* Stats card */
+.stat-card {
+    background-color: #0A0A0A;
+    border: 1px solid #27272A;
+    border-radius: 8px;
+    padding: 20px;
+}
+
+.stat-card:hover {
+    border-color: #3F3F46;
+}
+
+/* Stock card */
+.stock-card {
+    background-color: #0A0A0A;
+    border: 1px solid #27272A;
+    border-radius: 8px;
+    padding: 16px;
+    transition: border-color 0.2s ease;
+}
+
+.stock-card:hover {
+    border-color: #3F3F46;
+    cursor: pointer;
+}
+
+/* Trade recommendation card */
+.recommendation-card {
+    background-color: #0A0A0A;
+    border: 1px solid #27272A;
+    border-radius: 8px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+}
+
+.recommendation-card.buy {
+    border-left: 3px solid #00FF94;
+}
+
+.recommendation-card.sell {
+    border-left: 3px solid #FF3B30;
+}
+
+/* AI Analysis panel */
+.ai-panel {
+    background-color: #0A0A0A;
+    border: 1px solid rgba(112, 0, 255, 0.3);
+    border-radius: 8px;
+    position: relative;
+}
+
+.ai-panel::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(circle at top right, rgba(112, 0, 255, 0.1) 0%, rgba(0, 0, 0, 0) 50%);
+    pointer-events: none;
+    border-radius: 8px;
+}
+
+/* Table styles */
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.data-table th {
+    text-align: left;
+    padding: 12px 16px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #A1A1AA;
+    border-bottom: 1px solid #27272A;
+    background-color: #0A0A0A;
+}
+
+.data-table td {
+    padding: 12px 16px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.875rem;
+    border-bottom: 1px solid #1A1A1A;
+}
+
+.data-table tr:hover td {
+    background-color: #0F0F0F;
+}
+
+/* Badge styles */
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 10px;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    border-radius: 9999px;
+}
+
+.badge-sector {
+    background-color: #1A1A1A;
+    color: #A1A1AA;
+    border: 1px solid #27272A;
+}
+
+.badge-buy {
+    background-color: rgba(0, 255, 148, 0.1);
+    color: #00FF94;
+    border: 1px solid rgba(0, 255, 148, 0.3);
+}
+
+.badge-sell {
+    background-color: rgba(255, 59, 48, 0.1);
+    color: #FF3B30;
+    border: 1px solid rgba(255, 59, 48, 0.3);
+}
+
+.badge-pending {
+    background-color: rgba(255, 204, 0, 0.1);
+    color: #FFCC00;
+    border: 1px solid rgba(255, 204, 0, 0.3);
+}
+
+.badge-approved {
+    background-color: rgba(0, 255, 148, 0.1);
+    color: #00FF94;
+    border: 1px solid rgba(0, 255, 148, 0.3);
+}
+
+.badge-rejected {
+    background-color: rgba(255, 59, 48, 0.1);
+    color: #FF3B30;
+    border: 1px solid rgba(255, 59, 48, 0.3);
+}
+
+/* Button styles */
+.btn-trade-buy {
+    background-color: #00FF94;
+    color: #000;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 10px 20px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+.btn-trade-buy:hover {
+    background-color: #00CC76;
+}
+
+.btn-trade-sell {
+    background-color: #FF3B30;
+    color: #fff;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 10px 20px;
+    border-radius: 4px;
+    border: none;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+
+.btn-trade-sell:hover {
+    background-color: #CC2F26;
+}
+
+/* Scrollbar for specific elements */
+.custom-scrollbar::-webkit-scrollbar {
+    width: 4px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+    background: #27272A;
+    border-radius: 2px;
+}
+
+/* Loading spinner */
+.spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid #27272A;
+    border-top-color: #00FF94;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* Responsive adjustments */
+@media (max-width: 1024px) {
+    .sidebar {
+        width: 64px;
     }
-    to {
-        transform: rotate(360deg);
+    
+    .main-content {
+        margin-left: 64px;
+        padding: 16px;
+    }
+    
+    .sidebar-item span {
+        display: none;
+    }
+}
+
+@media (max-width: 768px) {
+    .sidebar {
+        display: none;
+    }
+    
+    .main-content {
+        margin-left: 0;
+        padding: 12px;
     }
 }
