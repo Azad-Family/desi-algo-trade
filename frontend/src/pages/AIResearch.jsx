@@ -1,7 +1,7 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import axios from "axios";
 import { motion } from "framer-motion";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { 
   Brain, 
   Search, 
@@ -21,10 +21,11 @@ import { ScrollArea } from "../components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
 import { toast } from "sonner";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || "http://localhost:8000"}/api`;
 
 export default function AIResearch() {
   const location = useLocation();
+  const navigate = useNavigate();
   const [stocks, setStocks] = useState([]);
   const [selectedStock, setSelectedStock] = useState(location.state?.stock || null);
   const [searchTerm, setSearchTerm] = useState("");
@@ -34,9 +35,27 @@ export default function AIResearch() {
   const [scanningAll, setScanningAll] = useState(false);
   const [analysisType, setAnalysisType] = useState("hybrid");
 
+  const autoSelectDone = useRef(!!selectedStock);
+
   useEffect(() => {
     fetchStocks();
+    if (!selectedStock) fetchLatestAnalysis();
   }, []);
+
+  useEffect(() => {
+    if (selectedStock) {
+      fetchLatestAnalysis(selectedStock.symbol);
+    }
+  }, [selectedStock?.symbol]);
+
+  // Auto-select the stock from the latest analysis once stocks are loaded
+  useEffect(() => {
+    if (!autoSelectDone.current && stocks.length > 0 && analysis?.stock_symbol && !selectedStock) {
+      autoSelectDone.current = true;
+      const match = stocks.find(s => s.symbol === analysis.stock_symbol);
+      if (match) setSelectedStock(match);
+    }
+  }, [stocks, analysis, selectedStock]);
 
   const fetchStocks = async () => {
     try {
@@ -44,6 +63,18 @@ export default function AIResearch() {
       setStocks(res.data);
     } catch (error) {
       console.error("Failed to fetch stocks:", error);
+    }
+  };
+
+  const fetchLatestAnalysis = async (symbol) => {
+    try {
+      const url = symbol
+        ? `${API}/ai/analysis/latest/${symbol}`
+        : `${API}/ai/analysis/latest`;
+      const res = await axios.get(url);
+      setAnalysis(res.data || null);
+    } catch (error) {
+      console.error("Failed to fetch latest analysis:", error);
     }
   };
 
@@ -93,11 +124,13 @@ export default function AIResearch() {
   const scanAllStocks = async () => {
     setScanningAll(true);
     try {
-      await axios.post(`${API}/ai/scan-all`);
-      toast.success("AI scan initiated! Check Trade Queue for recommendations.");
+      const res = await axios.post(`${API}/ai/scan-all`);
+      const { generated } = res.data;
+      toast.success(`Scan complete: ${generated} new recommendations generated`);
+      navigate("/queue");
     } catch (error) {
       console.error("Scan failed:", error);
-      toast.error("Failed to start scan");
+      toast.error("Failed to run scan");
     } finally {
       setScanningAll(false);
     }
@@ -151,7 +184,7 @@ export default function AIResearch() {
             <Brain className="w-8 h-8 text-ai-glow" />
             AI Research
           </h1>
-          <p className="text-muted-foreground mt-1">Deep analysis powered by Gemini 3 Flash</p>
+          <p className="text-muted-foreground mt-1">Deep analysis powered by Gemini 2.5 Flash</p>
         </div>
         <Button 
           onClick={scanAllStocks}
@@ -288,24 +321,61 @@ export default function AIResearch() {
                       animate={{ opacity: 1, y: 0 }}
                       className="space-y-4"
                     >
-                      {/* Confidence Score */}
-                      <div className="flex items-center gap-4 p-4 bg-surface-secondary rounded-lg">
-                        <div className="flex-1">
-                          <p className="data-label">AI Confidence Score</p>
-                          <div className="flex items-center gap-2 mt-2">
-                            <div className="flex-1 h-2 bg-surface-primary rounded-full overflow-hidden">
-                              <motion.div
-                                initial={{ width: 0 }}
-                                animate={{ width: `${analysis.confidence_score}%` }}
-                                className={`h-full ${
-                                  analysis.confidence_score >= 70 ? 'bg-signal-success' :
-                                  analysis.confidence_score >= 50 ? 'bg-signal-warning' : 'bg-signal-danger'
-                                }`}
-                              />
-                            </div>
-                            <span className="data-value">{analysis.confidence_score.toFixed(0)}%</span>
-                          </div>
+                      {/* Analysis Meta */}
+                      {analysis.created_at && (
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <RefreshCw className="w-3 h-3" />
+                          <span>
+                            Analyzed {new Date(analysis.created_at).toLocaleString()}
+                            {analysis.analysis_type && ` · ${analysis.analysis_type}`}
+                          </span>
                         </div>
+                      )}
+
+                      {/* Confidence + Horizon + Key Signals */}
+                      <div className="flex flex-col gap-3 p-4 bg-surface-secondary rounded-lg">
+                        <div className="flex items-center justify-between">
+                          <div className="flex-1">
+                            <p className="data-label">AI Confidence Score</p>
+                            <div className="flex items-center gap-2 mt-2">
+                              <div className="flex-1 h-2 bg-surface-primary rounded-full overflow-hidden">
+                                <motion.div
+                                  initial={{ width: 0 }}
+                                  animate={{ width: `${analysis.confidence_score}%` }}
+                                  className={`h-full ${
+                                    analysis.confidence_score >= 70 ? 'bg-signal-success' :
+                                    analysis.confidence_score >= 50 ? 'bg-signal-warning' : 'bg-signal-danger'
+                                  }`}
+                                />
+                              </div>
+                              <span className="data-value">{analysis.confidence_score.toFixed(0)}%</span>
+                            </div>
+                          </div>
+                          {analysis.trade_horizon && (
+                            <Badge className={`ml-4 text-xs ${
+                              analysis.trade_horizon === 'short_term' ? 'bg-signal-warning/20 text-signal-warning border-signal-warning/30' :
+                              analysis.trade_horizon === 'long_term' ? 'bg-ai-glow/20 text-ai-glow border-ai-glow/30' :
+                              'bg-signal-success/20 text-signal-success border-signal-success/30'
+                            }`}>
+                              {analysis.trade_horizon === 'short_term' ? 'Short Term (1-2w)' :
+                               analysis.trade_horizon === 'long_term' ? 'Long Term (3-12m)' :
+                               'Medium Term (1-3m)'}
+                            </Badge>
+                          )}
+                        </div>
+                        {analysis.key_signals && Object.keys(analysis.key_signals).length > 0 && (
+                          <div className="flex flex-wrap gap-2 pt-2 border-t border-border-subtle">
+                            {Object.entries(analysis.key_signals).map(([key, value]) => (
+                              <span key={key} className="text-[10px] px-2 py-0.5 rounded-full bg-surface-primary text-muted-foreground">
+                                {key.replace(/_/g, ' ')}: <span className={
+                                  value === 'bullish' || value === 'positive' || value === 'BUY' ? 'text-signal-success' :
+                                  value === 'bearish' || value === 'negative' || value === 'SELL' ? 'text-signal-danger' :
+                                  'text-foreground'
+                                }>{value}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
 
                       {/* Full Analysis */}

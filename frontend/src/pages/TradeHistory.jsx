@@ -16,7 +16,7 @@ import { Button } from "../components/ui/button";
 import { Badge } from "../components/ui/badge";
 import { ScrollArea } from "../components/ui/scroll-area";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || "http://localhost:8000"}/api`;
 
 export default function TradeHistory() {
   const [trades, setTrades] = useState([]);
@@ -122,6 +122,7 @@ export default function TradeHistory() {
                     <th className="text-left p-4">Price</th>
                     <th className="text-left p-4">Total Value</th>
                     <th className="text-left p-4">Order ID</th>
+                    <th className="text-left p-4">Mode</th>
                     <th className="text-left p-4">Status</th>
                   </tr>
                 </thead>
@@ -170,6 +171,22 @@ export default function TradeHistory() {
                         <code className="text-xs bg-surface-secondary px-2 py-1 rounded">
                           {trade.order_id || '-'}
                         </code>
+                      </td>
+                      <td className="p-4">
+                        <Badge className={`text-[10px] ${
+                          trade.trade_mode === 'live' ? 'bg-signal-success/20 text-signal-success border-signal-success/30' :
+                          trade.trade_mode === 'sandbox' ? 'bg-signal-warning/20 text-signal-warning border-signal-warning/30' :
+                          'bg-zinc-500/20 text-zinc-400 border-zinc-500/30'
+                        }`}
+                          title={
+                            trade.trade_mode === 'live' ? 'Real order placed on Upstox' :
+                            trade.trade_mode === 'sandbox' ? 'Paper trade via Upstox sandbox' :
+                            'No Upstox order — simulated locally'
+                          }
+                        >
+                          {trade.trade_mode === 'live' ? 'LIVE' :
+                           trade.trade_mode === 'sandbox' ? 'SANDBOX' : 'SIMULATED'}
+                        </Badge>
                       </td>
                       <td className="p-4">
                         <Badge className="badge-approved">{trade.status}</Badge>

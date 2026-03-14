@@ -1,3 +1,14 @@
+# AlgoTrade Frontend
+
+React UI for the AlgoTrade AI Trading Agent: Dashboard, Stock Universe, AI Research, Trade Queue, Portfolio, Trade History, and Settings. Built with React 19, React Router, Tailwind CSS, and shadcn/ui.
+
+- **Setup and env**: See [SETUP.md](./SETUP.md) for install, `REACT_APP_BACKEND_URL`, and troubleshooting.
+- **Project overview**: See the [root README](../README.md) and [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md).
+
+**Quick run:** `yarn install` → set `REACT_APP_BACKEND_URL=http://localhost:8000` → `yarn start` (app at http://localhost:3000).
+
+---
+
 # Getting Started with Create React App
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).

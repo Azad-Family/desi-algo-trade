@@ -1,4 +1,6 @@
 import { BrowserRouter, Routes, Route, NavLink, useLocation } from "react-router-dom";
+import { useState, useEffect } from "react";
+import axios from "axios";
 import { Toaster } from "./components/ui/sonner";
 import "@/App.css";
 import Dashboard from "./pages/Dashboard";
@@ -19,8 +21,40 @@ import {
   TrendingUp
 } from "lucide-react";
 
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
+const API = `${BACKEND_URL}/api`;
+
 const Sidebar = () => {
   const location = useLocation();
+  const [marketOpen, setMarketOpen] = useState(null);
+  const [currentTime, setCurrentTime] = useState(new Date());
+  
+  useEffect(() => {
+    // Check market status on mount and setup polling
+    const checkMarketStatus = async () => {
+      try {
+        const response = await axios.get(`${API}/market/status`);
+        setMarketOpen(response.data.is_open);
+      } catch (error) {
+        console.warn("Failed to fetch market status", error);
+      }
+    };
+    
+    checkMarketStatus();
+    
+    // Update every minute (market hours can be expensive to check frequently)
+    const interval = setInterval(checkMarketStatus, 60000);
+    
+    // Update time display
+    const timeInterval = setInterval(() => {
+      setCurrentTime(new Date());
+    }, 1000);
+    
+    return () => {
+      clearInterval(interval);
+      clearInterval(timeInterval);
+    };
+  }, []);
   
   const navItems = [
     { path: "/", icon: LayoutDashboard, label: "Dashboard" },
@@ -64,8 +98,28 @@ const Sidebar = () => {
       
       <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-border-subtle">
         <div className="flex items-center gap-2">
-          <div className="w-2 h-2 rounded-full bg-signal-success animate-pulse-glow" />
-          <span className="text-xs text-muted-foreground hidden lg:inline">Market Open</span>
+          <div 
+            className={`w-2 h-2 rounded-full animate-pulse-glow ${
+              marketOpen === true 
+                ? "bg-signal-success" 
+                : marketOpen === false 
+                ? "bg-signal-danger" 
+                : "bg-signal-warning"
+            }`}
+            title={marketOpen === true ? "Market Open" : "Market Closed"}
+          />
+          <div className="hidden lg:block">
+            <p className="text-xs text-muted-foreground">
+              {marketOpen === true 
+                ? "🟢 Market Open" 
+                : marketOpen === false 
+                ? "🔴 Market Closed" 
+                : "⏳ Loading..."}
+            </p>
+            {/* <p className="text-[10px] text-muted-foreground">
+              {currentTime.toLocaleTimeString('en-IN')}
+            </p> */}
+          </div>
         </div>
       </div>
     </aside>

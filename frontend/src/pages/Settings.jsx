@@ -9,7 +9,11 @@ import {
   Save,
   AlertTriangle,
   CheckCircle2,
-  ExternalLink
+  ExternalLink,
+  RefreshCw,
+  Wifi,
+  WifiOff,
+  Info
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "../components/ui/card";
 import { Button } from "../components/ui/button";
@@ -19,33 +23,43 @@ import { Switch } from "../components/ui/switch";
 import { Separator } from "../components/ui/separator";
 import { toast } from "sonner";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || "http://localhost:8000"}/api`;
 
 export default function Settings() {
   const [settings, setSettings] = useState({
-    upstox_api_key: '',
-    upstox_api_secret: '',
-    upstox_access_token: '',
     max_trade_value: 100000,
     max_position_size: 100,
     risk_per_trade_percent: 2,
     auto_analysis_enabled: true
   });
+  const [upstoxStatus, setUpstoxStatus] = useState(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [checkingUpstox, setCheckingUpstox] = useState(false);
 
   useEffect(() => {
-    fetchSettings();
+    Promise.all([fetchSettings(), fetchUpstoxStatus()]).finally(() => setLoading(false));
   }, []);
 
   const fetchSettings = async () => {
     try {
       const res = await axios.get(`${API}/settings`);
-      setSettings(res.data);
+      setSettings(prev => ({ ...prev, ...res.data }));
     } catch (error) {
       console.error("Failed to fetch settings:", error);
+    }
+  };
+
+  const fetchUpstoxStatus = async () => {
+    setCheckingUpstox(true);
+    try {
+      const res = await axios.get(`${API}/settings/upstox-status`);
+      setUpstoxStatus(res.data);
+    } catch (error) {
+      console.error("Failed to fetch Upstox status:", error);
+      setUpstoxStatus({ error: true });
     } finally {
-      setLoading(false);
+      setCheckingUpstox(false);
     }
   };
 
@@ -74,6 +88,13 @@ export default function Settings() {
     );
   }
 
+  const modeColor = upstoxStatus?.order_mode === "sandbox"
+    ? "text-signal-warning"
+    : "text-signal-success";
+  const modeBg = upstoxStatus?.order_mode === "sandbox"
+    ? "bg-signal-warning/10 border-signal-warning/20"
+    : "bg-signal-success/10 border-signal-success/20";
+
   return (
     <div data-testid="settings-page" className="space-y-6 max-w-4xl">
       {/* Header */}
@@ -82,79 +103,105 @@ export default function Settings() {
         <p className="text-muted-foreground mt-1">Configure your trading agent</p>
       </div>
 
-      {/* Upstox API Configuration */}
+      {/* Upstox Connection Status */}
       <Card className="bg-surface-primary border-border-subtle">
         <CardHeader className="border-b border-border-subtle">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-signal-warning/10 rounded-lg">
-              <Key className="w-5 h-5 text-signal-warning" />
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-signal-warning/10 rounded-lg">
+                <Key className="w-5 h-5 text-signal-warning" />
+              </div>
+              <div>
+                <CardTitle className="font-heading text-xl">Upstox Connection</CardTitle>
+                <CardDescription>Token status and connectivity (read-only)</CardDescription>
+              </div>
             </div>
-            <div>
-              <CardTitle className="font-heading text-xl">Upstox API Configuration</CardTitle>
-              <CardDescription>Connect your Upstox trading account</CardDescription>
-            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={fetchUpstoxStatus}
+              disabled={checkingUpstox}
+              className="border-border-subtle"
+            >
+              <RefreshCw className={`w-4 h-4 mr-1.5 ${checkingUpstox ? "animate-spin" : ""}`} />
+              Refresh
+            </Button>
           </div>
         </CardHeader>
-        <CardContent className="p-6 space-y-6">
-          <div className="p-4 bg-signal-warning/10 border border-signal-warning/20 rounded-lg flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-signal-warning flex-shrink-0 mt-0.5" />
-            <div>
-              <p className="text-sm font-medium text-signal-warning">Important</p>
-              <p className="text-sm text-muted-foreground mt-1">
-                Get your API credentials from{" "}
-                <a 
-                  href="https://account.upstox.com/developer/apps" 
-                  target="_blank" 
-                  rel="noopener noreferrer"
-                  className="text-signal-warning underline inline-flex items-center gap-1"
-                >
-                  Upstox Developer Portal
-                  <ExternalLink className="w-3 h-3" />
-                </a>
-              </p>
+        <CardContent className="p-6 space-y-5">
+          {upstoxStatus?.error ? (
+            <div className="p-4 bg-signal-danger/10 border border-signal-danger/20 rounded-lg flex items-start gap-3">
+              <WifiOff className="w-5 h-5 text-signal-danger flex-shrink-0 mt-0.5" />
+              <p className="text-sm text-signal-danger">Could not fetch Upstox status. Is the backend running?</p>
             </div>
-          </div>
+          ) : upstoxStatus ? (
+            <>
+              {/* Order Mode badge */}
+              <div className={`p-4 border rounded-lg flex items-center gap-3 ${modeBg}`}>
+                <Info className={`w-5 h-5 flex-shrink-0 ${modeColor}`} />
+                <div>
+                  <p className={`text-sm font-semibold ${modeColor} uppercase tracking-wide`}>
+                    {upstoxStatus.order_mode} mode
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Orders are placed via the {upstoxStatus.order_mode} API. Market data always uses a live token.
+                  </p>
+                </div>
+              </div>
 
-          <div className="grid gap-6">
-            <div className="space-y-2">
-              <Label>API Key</Label>
-              <Input
-                type="password"
-                value={settings.upstox_api_key || ''}
-                onChange={(e) => handleChange('upstox_api_key', e.target.value)}
-                placeholder="Enter your Upstox API Key"
-                className="bg-surface-secondary border-border-subtle font-mono"
-                data-testid="api-key-input"
-              />
-            </div>
-            
-            <div className="space-y-2">
-              <Label>API Secret</Label>
-              <Input
-                type="password"
-                value={settings.upstox_api_secret || ''}
-                onChange={(e) => handleChange('upstox_api_secret', e.target.value)}
-                placeholder="Enter your Upstox API Secret"
-                className="bg-surface-secondary border-border-subtle font-mono"
-                data-testid="api-secret-input"
-              />
-            </div>
-            
-            <div className="space-y-2">
-              <Label>Access Token</Label>
-              <Input
-                type="password"
-                value={settings.upstox_access_token || ''}
-                onChange={(e) => handleChange('upstox_access_token', e.target.value)}
-                placeholder="Enter your Access Token (valid for 24 hours)"
-                className="bg-surface-secondary border-border-subtle font-mono"
-                data-testid="access-token-input"
-              />
-              <p className="text-xs text-muted-foreground">
-                Access tokens expire daily. You'll need to refresh this regularly.
-              </p>
-            </div>
-          </div>
+              {/* Token status grid */}
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <StatusRow
+                  label="Market Data Token"
+                  masked={upstoxStatus.market_data_token}
+                  ok={upstoxStatus.market_data_ok}
+                />
+                <StatusRow
+                  label="Order Token"
+                  masked={upstoxStatus.order_token}
+                  ok={upstoxStatus.orders_ok}
+                />
+              </div>
+
+              {/* Connectivity */}
+              <div className="flex items-center gap-2 text-sm">
+                {upstoxStatus.market_data_connectivity === "ok" ? (
+                  <>
+                    <Wifi className="w-4 h-4 text-signal-success" />
+                    <span className="text-signal-success font-medium">API connectivity OK</span>
+                  </>
+                ) : (
+                  <>
+                    <WifiOff className="w-4 h-4 text-signal-danger" />
+                    <span className="text-signal-danger font-medium">
+                      API connectivity: {upstoxStatus.market_data_connectivity}
+                    </span>
+                  </>
+                )}
+              </div>
+
+              <Separator />
+
+              {/* How to update tokens */}
+              <div className="p-4 bg-surface-secondary rounded-lg space-y-2">
+                <p className="text-sm font-medium text-foreground">How to update tokens</p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Tokens are loaded from the <code className="px-1 py-0.5 bg-surface-primary rounded text-xs font-mono">backend/.env</code> file.
+                  Edit <code className="px-1 py-0.5 bg-surface-primary rounded text-xs font-mono">UPSTOX_ACCESS_TOKEN</code>{" "}
+                  (live) or <code className="px-1 py-0.5 bg-surface-primary rounded text-xs font-mono">UPSTOX_SANDBOX_ACCESS_TOKEN</code>{" "}
+                  (sandbox), then restart the backend server.
+                </p>
+                <a
+                  href="https://account.upstox.com/developer/apps"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-xs text-signal-warning hover:underline mt-1"
+                >
+                  Open Upstox Developer Portal <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            </>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -174,7 +221,7 @@ export default function Settings() {
         <CardContent className="p-6 space-y-6">
           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
             <div className="space-y-2">
-              <Label>Max Trade Value (₹)</Label>
+              <Label>Max Trade Value (&#x20B9;)</Label>
               <Input
                 type="number"
                 value={settings.max_trade_value}
@@ -259,6 +306,24 @@ export default function Settings() {
           Save Settings
         </Button>
       </div>
+    </div>
+  );
+}
+
+function StatusRow({ label, masked, ok }) {
+  return (
+    <div className="flex items-center justify-between p-3 bg-surface-secondary rounded-lg">
+      <div>
+        <p className="text-xs text-muted-foreground">{label}</p>
+        <p className="text-sm font-mono mt-0.5">
+          {masked || <span className="text-signal-danger italic">not set</span>}
+        </p>
+      </div>
+      {ok ? (
+        <CheckCircle2 className="w-5 h-5 text-signal-success" />
+      ) : (
+        <AlertTriangle className="w-5 h-5 text-signal-danger" />
+      )}
     </div>
   );
 }

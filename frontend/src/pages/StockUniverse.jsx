@@ -8,7 +8,8 @@ import {
   TrendingUp, 
   TrendingDown,
   RefreshCw,
-  Layers
+  Layers,
+  AlertCircle
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
@@ -16,10 +17,15 @@ import { Input } from "../components/ui/input";
 import { Badge } from "../components/ui/badge";
 import { ScrollArea } from "../components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../components/ui/tabs";
+import { Alert, AlertDescription } from "../components/ui/alert";
 import { toast } from "sonner";
 import { useNavigate } from "react-router-dom";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
+const API = `${BACKEND_URL}/api`;
+
+// Log API endpoint for debugging
+console.log("🔌 API Configuration:", { BACKEND_URL, API, env: process.env.REACT_APP_BACKEND_URL });
 
 const SECTOR_COLORS = {
   IT: "bg-blue-500/10 text-blue-400 border-blue-500/30",
@@ -54,16 +60,16 @@ const StockCard = ({ stock, onAnalyze }) => (
     
     <div className="flex items-center justify-between mb-3">
       <div>
-        <p className="data-label">Price</p>
+        <p className="data-label" title="Last traded price from Upstox (from last refresh)">Price (LTP)</p>
         <p className="font-mono text-lg">
-          {stock.current_price > 0 ? `₹${stock.current_price.toLocaleString()}` : '-'}
+          {stock.current_price != null && stock.current_price > 0 ? `₹${Number(stock.current_price).toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '-'}
         </p>
       </div>
       <div className="text-right">
-        <p className="data-label">Change</p>
+        <p className="data-label" title="Percentage change from previous close (from last refresh)">Day Chg %</p>
         <p className={`font-mono flex items-center gap-1 ${stock.change_percent >= 0 ? 'text-signal-success' : 'text-signal-danger'}`}>
           {stock.change_percent >= 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
-          {stock.change_percent?.toFixed(2) || 0}%
+          {stock.change_percent != null ? `${(stock.change_percent >= 0 ? '+' : '')}${Number(stock.change_percent).toFixed(2)}%` : '-'}
         </p>
       </div>
     </div>
@@ -90,6 +96,7 @@ export default function StockUniverse() {
   const navigate = useNavigate();
 
   const fetchData = async () => {
+    setLoading(true);
     try {
       const [stocksRes, sectorsRes] = await Promise.all([
         axios.get(`${API}/stocks`),
@@ -97,9 +104,20 @@ export default function StockUniverse() {
       ]);
       setStocks(stocksRes.data);
       setSectors(sectorsRes.data);
+      console.log("✓ Loaded", stocksRes.data.length, "stocks from API");
     } catch (error) {
-      console.error("Failed to fetch stocks:", error);
-      toast.error("Failed to load stocks");
+      console.error("❌ API Error Details:", {
+        message: error.message,
+        code: error.code,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
+        url: `${API}/stocks`,
+        backendUrl: BACKEND_URL
+      });
+      
+      const errorMsg = error.response?.data?.detail || error.message || "Unknown error";
+      toast.error(`Failed to load stocks: ${errorMsg}`);
     } finally {
       setLoading(false);
     }
@@ -108,18 +126,27 @@ export default function StockUniverse() {
   const initializeStocks = async () => {
     setRefreshing(true);
     try {
-      await axios.post(`${API}/stocks/initialize`);
+      const res = await axios.post(`${API}/stocks/refresh`);
+      console.log("✓ Stock prices updated:", res.data);
       await fetchData();
-      toast.success("Stock universe initialized");
+      toast.success(`Updated ${res.data.updated}/${res.data.total} stock prices`);
     } catch (error) {
-      console.error("Failed to initialize:", error);
-      toast.error("Failed to initialize stocks");
+      console.error("❌ Refresh Error:", {
+        message: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+        url: `${API}/stocks/refresh`
+      });
+      
+      const errorMsg = error.response?.data?.detail || error.message || "Unknown error";
+      toast.error(`Failed to refresh prices: ${errorMsg}`);
     } finally {
       setRefreshing(false);
     }
   };
 
   useEffect(() => {
+    // Fetch stocks (backend initializes them on startup)
     fetchData();
   }, []);
 

@@ -8,7 +8,6 @@ import {
   TrendingUp, 
   TrendingDown,
   AlertCircle,
-  Filter,
   RefreshCw,
   Edit3
 } from "lucide-react";
@@ -21,7 +20,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "
 import { Label } from "../components/ui/label";
 import { toast } from "sonner";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || "http://localhost:8000"}/api`;
 
 const STATUS_BADGES = {
   pending: "badge-pending",
@@ -54,21 +53,61 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
       </Badge>
     </td>
     <td className="p-4 font-mono">{rec.quantity}</td>
-    <td className="p-4 font-mono">₹{rec.target_price?.toLocaleString()}</td>
-    <td className="p-4 font-mono text-signal-danger">₹{rec.stop_loss?.toLocaleString() || '-'}</td>
+    <td className="p-4 font-mono" title="Current / last price when recommendation was generated">
+      {rec.current_price != null && rec.current_price > 0 ? `₹${Number(rec.current_price).toLocaleString(undefined, { minimumFractionDigits: 2 })}` : '-'}
+    </td>
+    <td className="p-4 font-mono">₹{rec.target_price != null ? Number(rec.target_price).toLocaleString(undefined, { minimumFractionDigits: 2 }) : '-'}</td>
+    <td className="p-4 font-mono text-signal-danger">₹{rec.stop_loss != null ? Number(rec.stop_loss).toLocaleString(undefined, { minimumFractionDigits: 2 }) : '-'}</td>
     <td className="p-4">
       <div className="flex items-center gap-2">
         <div className="w-16 h-1.5 bg-surface-primary rounded-full overflow-hidden">
           <div 
-            className={`h-full ${rec.confidence_score >= 70 ? 'bg-signal-success' : rec.confidence_score >= 50 ? 'bg-signal-warning' : 'bg-signal-danger'}`}
-            style={{ width: `${rec.confidence_score}%` }}
+            className={`h-full ${(rec.confidence_score ?? 0) >= 70 ? 'bg-signal-success' : (rec.confidence_score ?? 0) >= 50 ? 'bg-signal-warning' : 'bg-signal-danger'}`}
+            style={{ width: `${Math.min(100, Math.max(0, rec.confidence_score ?? 0))}%` }}
           />
         </div>
-        <span className="text-xs font-mono">{rec.confidence_score?.toFixed(0)}%</span>
+        <span className="text-xs font-mono">{rec.confidence_score != null ? `${Number(rec.confidence_score).toFixed(0)}%` : '-'}</span>
       </div>
     </td>
     <td className="p-4">
-      <Badge className={STATUS_BADGES[rec.status]}>{rec.status}</Badge>
+      {rec.trade_horizon ? (
+        <Badge className={`text-[10px] ${
+          rec.trade_horizon === 'short_term' ? 'bg-signal-warning/20 text-signal-warning' :
+          rec.trade_horizon === 'long_term' ? 'bg-ai-glow/20 text-ai-glow' :
+          'bg-signal-success/20 text-signal-success'
+        }`}>
+          {rec.trade_horizon === 'short_term' ? 'Short' :
+           rec.trade_horizon === 'long_term' ? 'Long' : 'Medium'}
+        </Badge>
+      ) : (
+        <span className="text-xs text-muted-foreground">-</span>
+      )}
+    </td>
+    <td className="p-4">
+      <div className="flex items-center gap-1">
+        <Badge className={STATUS_BADGES[rec.status]}>{rec.status}</Badge>
+        {rec.status === 'executed' && rec.trade_mode && (
+          <Badge className={`text-[9px] ${
+            rec.trade_mode === 'live' ? 'bg-signal-success/20 text-signal-success' :
+            rec.trade_mode === 'sandbox' ? 'bg-signal-warning/20 text-signal-warning' :
+            'bg-zinc-500/20 text-zinc-400'
+          }`}
+            title={
+              rec.trade_mode === 'live' ? 'Real order placed on Upstox' :
+              rec.trade_mode === 'sandbox' ? 'Paper trade via Upstox sandbox' :
+              'No Upstox order — simulated locally'
+            }
+          >
+            {rec.trade_mode === 'live' ? 'LIVE' :
+             rec.trade_mode === 'sandbox' ? 'SANDBOX' : 'SIM'}
+          </Badge>
+        )}
+      </div>
+    </td>
+    <td className="p-4 text-xs text-muted-foreground" title="When this recommendation was generated (scan date/time)">
+      {rec.created_at
+        ? new Date(rec.created_at).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' })
+        : '-'}
     </td>
     <td className="p-4">
       {rec.status === 'pending' ? (
@@ -101,16 +140,18 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
         </div>
       ) : (
         <span className="text-xs text-muted-foreground">
-          {new Date(rec.updated_at).toLocaleDateString()}
+          {rec.updated_at ? new Date(rec.updated_at).toLocaleDateString() : '-'}
         </span>
       )}
     </td>
   </motion.tr>
 );
 
+const TABS = { PENDING_BUY: "pending_buy", PENDING_SELL: "pending_sell", HISTORY: "history" };
+
 export default function TradeQueue() {
   const [recommendations, setRecommendations] = useState([]);
-  const [filter, setFilter] = useState("all");
+  const [tab, setTab] = useState(TABS.PENDING_BUY);
   const [loading, setLoading] = useState(true);
   const [editDialog, setEditDialog] = useState({ open: false, rec: null });
   const [editForm, setEditForm] = useState({ quantity: 0, price: 0 });
@@ -129,6 +170,17 @@ export default function TradeQueue() {
   useEffect(() => {
     fetchRecommendations();
   }, []);
+
+  const pendingBuy = recommendations.filter((r) => r.status === "pending" && r.action === "BUY");
+  const pendingSell = recommendations.filter((r) => r.status === "pending" && r.action === "SELL");
+  const history = recommendations.filter((r) => r.status === "executed" || r.status === "rejected");
+
+  const filteredRecs =
+    tab === TABS.PENDING_BUY
+      ? pendingBuy
+      : tab === TABS.PENDING_SELL
+        ? pendingSell
+        : history;
 
   const handleApprove = async (rec) => {
     try {
@@ -173,14 +225,6 @@ export default function TradeQueue() {
     }
   };
 
-  const filteredRecs = recommendations.filter(rec => {
-    if (filter === "all") return true;
-    return rec.status === filter;
-  });
-
-  const pendingCount = recommendations.filter(r => r.status === 'pending').length;
-  const approvedCount = recommendations.filter(r => r.status === 'approved' || r.status === 'executed').length;
-  const rejectedCount = recommendations.filter(r => r.status === 'rejected').length;
 
   if (loading) {
     return (
@@ -204,64 +248,37 @@ export default function TradeQueue() {
         </Button>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-3 gap-4">
-        <Card 
-          className={`bg-surface-primary border-border-subtle cursor-pointer ${filter === 'pending' ? 'ring-2 ring-signal-warning' : ''}`}
-          onClick={() => setFilter('pending')}
+      {/* BUY / SELL / History tabs */}
+      <div className="flex items-center gap-2 border-b border-border-subtle pb-2">
+        <Button
+          variant={tab === TABS.PENDING_BUY ? "default" : "outline"}
+          size="sm"
+          onClick={() => setTab(TABS.PENDING_BUY)}
+          className={tab === TABS.PENDING_BUY ? "bg-signal-success hover:bg-signal-success/90" : ""}
+          data-testid="tab-pending-buy"
         >
-          <CardContent className="p-4 flex items-center justify-between">
-            <div>
-              <p className="data-label">Pending</p>
-              <p className="data-value text-2xl text-signal-warning">{pendingCount}</p>
-            </div>
-            <Clock className="w-8 h-8 text-signal-warning/50" />
-          </CardContent>
-        </Card>
-        
-        <Card 
-          className={`bg-surface-primary border-border-subtle cursor-pointer ${filter === 'executed' ? 'ring-2 ring-signal-success' : ''}`}
-          onClick={() => setFilter('executed')}
+          <TrendingUp className="w-4 h-4 mr-1" />
+          Pending BUY ({pendingBuy.length})
+        </Button>
+        <Button
+          variant={tab === TABS.PENDING_SELL ? "default" : "outline"}
+          size="sm"
+          onClick={() => setTab(TABS.PENDING_SELL)}
+          className={tab === TABS.PENDING_SELL ? "bg-signal-danger hover:bg-signal-danger/90" : ""}
+          data-testid="tab-pending-sell"
         >
-          <CardContent className="p-4 flex items-center justify-between">
-            <div>
-              <p className="data-label">Executed</p>
-              <p className="data-value text-2xl text-signal-success">{approvedCount}</p>
-            </div>
-            <CheckCircle2 className="w-8 h-8 text-signal-success/50" />
-          </CardContent>
-        </Card>
-        
-        <Card 
-          className={`bg-surface-primary border-border-subtle cursor-pointer ${filter === 'rejected' ? 'ring-2 ring-signal-danger' : ''}`}
-          onClick={() => setFilter('rejected')}
+          <TrendingDown className="w-4 h-4 mr-1" />
+          Pending SELL ({pendingSell.length})
+        </Button>
+        <Button
+          variant={tab === TABS.HISTORY ? "default" : "outline"}
+          size="sm"
+          onClick={() => setTab(TABS.HISTORY)}
+          data-testid="tab-history"
         >
-          <CardContent className="p-4 flex items-center justify-between">
-            <div>
-              <p className="data-label">Rejected</p>
-              <p className="data-value text-2xl text-signal-danger">{rejectedCount}</p>
-            </div>
-            <XCircle className="w-8 h-8 text-signal-danger/50" />
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Filter */}
-      <div className="flex items-center gap-4">
-        <Filter className="w-4 h-4 text-muted-foreground" />
-        <div className="flex gap-2">
-          {['all', 'pending', 'executed', 'rejected'].map((status) => (
-            <Button
-              key={status}
-              variant={filter === status ? "default" : "outline"}
-              size="sm"
-              onClick={() => setFilter(status)}
-              data-testid={`filter-${status}`}
-            >
-              {status.charAt(0).toUpperCase() + status.slice(1)}
-            </Button>
-          ))}
-        </div>
+          <Clock className="w-4 h-4 mr-1" />
+          History ({history.length})
+        </Button>
       </div>
 
       {/* Recommendations Table */}
@@ -270,8 +287,14 @@ export default function TradeQueue() {
           {filteredRecs.length === 0 ? (
             <div className="text-center py-16">
               <AlertCircle className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
-              <p className="text-muted-foreground">No recommendations found</p>
-              <p className="text-sm text-muted-foreground mt-1">Run AI scan to generate trade ideas</p>
+              <p className="text-muted-foreground">
+                {tab === TABS.PENDING_BUY && "No pending BUY recommendations"}
+                {tab === TABS.PENDING_SELL && "No pending SELL recommendations"}
+                {tab === TABS.HISTORY && "No executed or rejected trades in history"}
+              </p>
+              <p className="text-sm text-muted-foreground mt-1">
+                {tab !== TABS.HISTORY && "Run AI scan (or Portfolio Sell Scan) to generate trade ideas"}
+              </p>
             </div>
           ) : (
             <ScrollArea className="w-full">
@@ -281,10 +304,13 @@ export default function TradeQueue() {
                     <th className="text-left p-4">Stock</th>
                     <th className="text-left p-4">Action</th>
                     <th className="text-left p-4">Qty</th>
+                    <th className="text-left p-4">Price</th>
                     <th className="text-left p-4">Target</th>
                     <th className="text-left p-4">Stop Loss</th>
                     <th className="text-left p-4">Confidence</th>
+                    <th className="text-left p-4">Horizon</th>
                     <th className="text-left p-4">Status</th>
+                    <th className="text-left p-4">Scan at</th>
                     <th className="text-left p-4">Actions</th>
                   </tr>
                 </thead>

@@ -20,7 +20,7 @@ import { Badge } from "../components/ui/badge";
 import { ScrollArea } from "../components/ui/scroll-area";
 import { useNavigate } from "react-router-dom";
 
-const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL || "http://localhost:8000"}/api`;
 
 const StatCard = ({ title, value, change, icon: Icon, trend, delay = 0 }) => (
   <motion.div
@@ -133,9 +133,9 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
+    // Only load data, don't initialize stocks here
+    // Stock initialization is handled by StockUniverse component
     fetchData();
-    // Initialize stock universe on first load
-    axios.post(`${API}/stocks/initialize`).catch(() => {});
   }, []);
 
   const handleApprove = async (recId) => {
