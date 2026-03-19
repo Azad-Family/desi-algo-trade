@@ -16,10 +16,13 @@ IST = pytz.timezone('Asia/Kolkata')
 
 NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
-# Symbols that don't match NSE instrument file trading_symbol (e.g. different casing/format)
+# Symbols whose trading_symbol in Upstox instrument master differs from our database symbol.
+# Maps our_symbol -> ISIN-based instrument_key for request resolution.
 SYMBOL_OVERRIDES = {
-    "LTIM": "NSE_EQ|INE214T01019",       # LTIMindtree Ltd
-    "TATAMOTORS": "NSE_EQ|INE155A01022",  # Tata Motors
+    "LTIM": "NSE_EQ|INE214T01019",        # Upstox uses "LTM"
+    "TATAMOTORS": "NSE_EQ|INE1TAE01010",  # Demerged → Upstox uses "TMCV"
+    "ZOMATO": "NSE_EQ|INE758T01015",      # Rebranded → Upstox uses "ETERNAL"
+    "ADANIENSO": "NSE_EQ|INE931S01010",   # Upstox uses "ADANIENSOL"
 }
 
 
@@ -99,7 +102,7 @@ class UpstoxClient:
                 instruments = json.loads(raw)
 
                 for inst in instruments:
-                    if inst.get("segment") == "NSE_EQ" and inst.get("instrument_type") == "EQ":
+                    if inst.get("segment") == "NSE_EQ" and inst.get("instrument_type") in ("EQ", "ETF"):
                         ts = inst.get("trading_symbol", "")
                         ik = inst.get("instrument_key", "")
                         if ts and ik:
@@ -181,17 +184,25 @@ class UpstoxClient:
         
         await self._ensure_instrument_map()
         
-        # Build symbol <-> instrument_key mapping
+        # Build symbol -> instrument_key mapping for request
         sym_to_key = {}
         for symbol in symbols:
             key = await self.resolve_instrument_key(symbol)
             sym_to_key[symbol] = key
         
-        # Reverse map: response key format "NSE_EQ:SYMBOL" -> original symbol
-        # The response key uses the trading_symbol from the instrument master
+        # Reverse map: Upstox responds with "NSE_EQ:ACTUAL_TRADING_SYMBOL".
+        # For overridden symbols, the actual trading symbol on Upstox differs
+        # from our symbol (e.g. ZOMATO→ETERNAL, LTIM→LTM).
+        # Build isin→actual_trading_symbol from the instrument map, then
+        # map NSE_EQ:actual_trading_symbol → our_symbol.
+        isin_to_ts = {ik: ts for ts, ik in UpstoxClient._instrument_map.items()}
         key_to_sym = {}
         for symbol in symbols:
-            key_to_sym[f"NSE_EQ:{symbol}"] = symbol
+            inst_key = sym_to_key[symbol]
+            actual_ts = isin_to_ts.get(inst_key, symbol)
+            key_to_sym[f"NSE_EQ:{actual_ts}"] = symbol
+            if actual_ts != symbol:
+                key_to_sym[f"NSE_EQ:{symbol}"] = symbol
         
         quotes = {}
         BATCH_SIZE = 50
@@ -295,8 +306,14 @@ class UpstoxClient:
             logger.error(f"Historical candle fetch error for {symbol}: {e}")
         return []
 
-    async def place_order(self, symbol: str, action: str, quantity: int, price: float) -> Dict[str, Any]:
+    async def place_order(self, symbol: str, action: str, quantity: int, price: float,
+                          product_type: str = "D") -> Dict[str, Any]:
         """Place an order through Upstox.
+
+        Args:
+            product_type: "D" for Delivery, "I" for Intraday (used for SHORT trades).
+            action: "BUY" or "SELL". For SHORT trades, caller should pass action="SELL"
+                    with product_type="I".
 
         Returns dict with at least: order_id, status, trade_mode.
         trade_mode is one of: "live", "sandbox", "simulated".
@@ -321,7 +338,7 @@ class UpstoxClient:
                 }
                 order_data = {
                     "quantity": quantity,
-                    "product": "D",
+                    "product": product_type,
                     "validity": "DAY",
                     "price": price,
                     "instrument_token": instrument_key,

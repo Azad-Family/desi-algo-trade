@@ -16,7 +16,11 @@ from starlette.middleware.cors import CORSMiddleware
 
 from database import db, close_db
 from routes import api_router
+from agent_routes import agent_router
+from sandbox_routes import sandbox_router
 from stock_init import initialize_stocks, get_stock_count
+from ai_engine import set_preferred_model
+from scheduler import start_scheduler, stop_scheduler, is_scheduler_running
 
 # Configure logging with console output
 logging.basicConfig(
@@ -57,18 +61,30 @@ async def startup_event():
             count = await initialize_stocks()
             logger.info(f"✓ Startup initialization complete: {count} stocks loaded")
         else:
-            # On all SUBSEQUENT startups (database already has stocks)
             logger.info(f"✓ Stock database ready: {stock_count} stocks available")
-    
+
+        # Restore user's preferred Gemini model from DB
+        settings = await db.settings.find_one({"id": "main_settings"}, {"_id": 0})
+        if settings and settings.get("gemini_model"):
+            set_preferred_model(settings["gemini_model"])
+            logger.info(f"✓ Gemini model preference loaded: {settings['gemini_model']}")
+
+        # Auto-start sandbox scheduler (daily scan + intraday monitor)
+        scheduler_config = await db.scheduler_config.find_one({"id": "scheduler_config"}, {"_id": 0})
+        should_start = not scheduler_config or scheduler_config.get("enabled", True)
+        if should_start and not is_scheduler_running():
+            await start_scheduler()
+            logger.info("✓ Sandbox scheduler auto-started")
+
     except Exception as e:
         logger.error(f"✗ Startup initialization failed: {e}")
-        # Don't crash the app, just log the error
-        # Users can manually initialize via POST /api/stocks/initialize if needed
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Close database connection on app shutdown"""
+    """Stop scheduler and close database connection on app shutdown"""
+    if is_scheduler_running():
+        await stop_scheduler()
     await close_db()
 
 
@@ -81,8 +97,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============ ROUTER ============
+# ============ ROUTERS ============
 app.include_router(api_router)
+app.include_router(agent_router)
+app.include_router(sandbox_router)
 
 
 if __name__ == "__main__":

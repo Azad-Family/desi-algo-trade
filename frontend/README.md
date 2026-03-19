@@ -1,81 +1,67 @@
-# AlgoTrade Frontend
+# Frontend — Desi Algo Trade
 
-React UI for the AlgoTrade AI Trading Agent: Dashboard, Stock Universe, AI Research, Trade Queue, Portfolio, Trade History, and Settings. Built with React 19, React Router, Tailwind CSS, and shadcn/ui.
-
-- **Setup and env**: See [SETUP.md](./SETUP.md) for install, `REACT_APP_BACKEND_URL`, and troubleshooting.
-- **Project overview**: See the [root README](../README.md) and [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md).
-
-**Quick run:** `yarn install` → set `REACT_APP_BACKEND_URL=http://localhost:8000` → `yarn start` (app at http://localhost:3000).
+React UI for the Desi Algo Trade AI Trading Agent. Built with React 19, React Router, Tailwind CSS, shadcn/ui, Framer Motion, and Recharts.
 
 ---
 
-# Getting Started with Create React App
+## Pages
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+| Route | Page | Description |
+|-------|------|-------------|
+| `/` | **Agent** | Conversational AI agent — the primary interface for briefings, stock discovery, analysis, trade signals, and portfolio management through natural language. |
+| `/research` | **Research** | Stock browser with live prices, sector filter, and AI analysis panel. Run individual analyses or scan all stocks. |
+| `/trades` | **Trades** | Pending BUY/SHORT/SELL signals with approve/edit/reject actions, recommendation history, executed trade log with stats. |
+| `/portfolio` | **Portfolio** | Mode-scoped holdings with P&L, sector allocation pie chart, AI sell scan, and direct sell with quantity control. |
+| `/sandbox` | **Sandbox** | Virtual paper trading dashboard — ₹1L virtual account, AI-driven strategy, automated scheduler control, and performance analytics. |
+| `/settings` | **Settings** | Risk parameters, Gemini model selection, and Upstox connectivity status. |
 
-## Available Scripts
+---
 
-In the project directory, you can run:
+## Setup
 
-### `npm start`
+```bash
+cd frontend
+yarn install
+```
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+Set the backend URL environment variable:
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+```bash
+# PowerShell
+$env:REACT_APP_BACKEND_URL = "http://localhost:8000"
 
-### `npm test`
+# Bash
+export REACT_APP_BACKEND_URL=http://localhost:8000
+```
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+Start development server:
 
-### `npm run build`
+```bash
+yarn start
+```
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+App runs at **http://localhost:3000**.
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
+---
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+## Environment
 
-### `npm run eject`
+| Variable | Purpose |
+|----------|--------|
+| `REACT_APP_BACKEND_URL` | Backend base URL (e.g. `http://localhost:8000`). No `/api` suffix. |
 
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
+---
 
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+## Key Dependencies
 
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
+- **react** / **react-dom** — UI framework
+- **react-router-dom** — Client-side routing
+- **axios** — HTTP client for API calls
+- **tailwindcss** — Utility-first CSS
+- **framer-motion** — Animations and transitions
+- **recharts** — Charts (sector allocation pie chart)
+- **lucide-react** — Icon library
+- **sonner** — Toast notifications
 
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+See [SETUP.md](./SETUP.md) for detailed install and troubleshooting.
+See [root README](../README.md) and [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) for full project overview.

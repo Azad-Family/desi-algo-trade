@@ -13,7 +13,9 @@ import {
   RefreshCw,
   Wifi,
   WifiOff,
-  Info
+  Info,
+  Brain,
+  Zap,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "../components/ui/card";
 import { Button } from "../components/ui/button";
@@ -33,12 +35,14 @@ export default function Settings() {
     auto_analysis_enabled: true
   });
   const [upstoxStatus, setUpstoxStatus] = useState(null);
+  const [modelInfo, setModelInfo] = useState({ available: [], preferred: null, active: "" });
+  const [modelSaving, setModelSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [checkingUpstox, setCheckingUpstox] = useState(false);
 
   useEffect(() => {
-    Promise.all([fetchSettings(), fetchUpstoxStatus()]).finally(() => setLoading(false));
+    Promise.all([fetchSettings(), fetchUpstoxStatus(), fetchModels()]).finally(() => setLoading(false));
   }, []);
 
   const fetchSettings = async () => {
@@ -60,6 +64,28 @@ export default function Settings() {
       setUpstoxStatus({ error: true });
     } finally {
       setCheckingUpstox(false);
+    }
+  };
+
+  const fetchModels = async () => {
+    try {
+      const res = await axios.get(`${API}/settings/models`);
+      setModelInfo(res.data);
+    } catch (error) {
+      console.warn("Failed to fetch models:", error);
+    }
+  };
+
+  const handleModelChange = async (model) => {
+    setModelSaving(true);
+    try {
+      const res = await axios.post(`${API}/settings/model`, { model: model || null });
+      toast.success(`Model set to ${model || "auto"}`);
+      setModelInfo((prev) => ({ ...prev, preferred: model || null, active: res.data.active }));
+    } catch (error) {
+      toast.error("Failed to set model");
+    } finally {
+      setModelSaving(false);
     }
   };
 
@@ -164,20 +190,9 @@ export default function Settings() {
               </div>
 
               {/* Connectivity */}
-              <div className="flex items-center gap-2 text-sm">
-                {upstoxStatus.market_data_connectivity === "ok" ? (
-                  <>
-                    <Wifi className="w-4 h-4 text-signal-success" />
-                    <span className="text-signal-success font-medium">API connectivity OK</span>
-                  </>
-                ) : (
-                  <>
-                    <WifiOff className="w-4 h-4 text-signal-danger" />
-                    <span className="text-signal-danger font-medium">
-                      API connectivity: {upstoxStatus.market_data_connectivity}
-                    </span>
-                  </>
-                )}
+              <div className="space-y-2">
+                <ConnectivityRow label="Market Data API" status={upstoxStatus.market_data_connectivity} />
+                <ConnectivityRow label="Order API" status={upstoxStatus.order_connectivity} />
               </div>
 
               <Separator />
@@ -265,15 +280,69 @@ export default function Settings() {
         <CardHeader className="border-b border-border-subtle">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-ai-glow/10 rounded-lg">
-              <Bell className="w-5 h-5 text-ai-glow" />
+              <Brain className="w-5 h-5 text-ai-glow" />
             </div>
             <div>
               <CardTitle className="font-heading text-xl">AI Agent Settings</CardTitle>
-              <CardDescription>Configure AI analysis behavior</CardDescription>
+              <CardDescription>Configure AI model and analysis behavior</CardDescription>
             </div>
           </div>
         </CardHeader>
-        <CardContent className="p-6">
+        <CardContent className="p-6 space-y-6">
+          {/* Model Selector */}
+          <div className="space-y-3">
+            <Label className="text-sm font-medium">Gemini Model</Label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                onClick={() => handleModelChange(null)}
+                disabled={modelSaving}
+                className={`flex items-center gap-3 p-3 rounded-lg border transition-colors text-left ${
+                  !modelInfo.preferred
+                    ? "border-purple-500/50 bg-purple-500/10"
+                    : "border-border-subtle bg-surface-secondary hover:border-border-active"
+                }`}
+              >
+                <Zap className={`w-4 h-4 flex-shrink-0 ${!modelInfo.preferred ? "text-purple-400" : "text-muted-foreground"}`} />
+                <div>
+                  <p className={`text-sm font-medium ${!modelInfo.preferred ? "text-purple-400" : "text-foreground"}`}>
+                    Auto (Smart Fallback)
+                  </p>
+                  <p className="text-[10px] text-muted-foreground">Uses priority list with rate-limit fallback</p>
+                </div>
+              </button>
+              {modelInfo.available.map((model) => (
+                <button
+                  key={model}
+                  onClick={() => handleModelChange(model)}
+                  disabled={modelSaving}
+                  className={`flex items-center gap-3 p-3 rounded-lg border transition-colors text-left ${
+                    modelInfo.preferred === model
+                      ? "border-purple-500/50 bg-purple-500/10"
+                      : "border-border-subtle bg-surface-secondary hover:border-border-active"
+                  }`}
+                >
+                  <Brain className={`w-4 h-4 flex-shrink-0 ${modelInfo.preferred === model ? "text-purple-400" : "text-muted-foreground"}`} />
+                  <div>
+                    <p className={`text-sm font-mono font-medium ${modelInfo.preferred === model ? "text-purple-400" : "text-foreground"}`}>
+                      {model}
+                    </p>
+                    {modelInfo.active === model && (
+                      <p className="text-[10px] text-signal-success">currently active</p>
+                    )}
+                  </div>
+                </button>
+              ))}
+            </div>
+            {modelSaving && (
+              <p className="text-xs text-muted-foreground flex items-center gap-1">
+                <div className="spinner w-3 h-3" /> Switching model...
+              </p>
+            )}
+          </div>
+
+          <Separator />
+
+          {/* Auto Analysis Toggle */}
           <div className="flex items-center justify-between">
             <div>
               <p className="font-medium">Auto Analysis</p>
@@ -324,6 +393,26 @@ function StatusRow({ label, masked, ok }) {
       ) : (
         <AlertTriangle className="w-5 h-5 text-signal-danger" />
       )}
+    </div>
+  );
+}
+
+function ConnectivityRow({ label, status }) {
+  const isOk = status === "ok";
+  const isNoToken = status === "no token";
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      {isOk ? (
+        <Wifi className="w-4 h-4 text-signal-success flex-shrink-0" />
+      ) : (
+        <WifiOff className={`w-4 h-4 flex-shrink-0 ${isNoToken ? "text-muted-foreground" : "text-signal-danger"}`} />
+      )}
+      <span className={`font-medium ${isOk ? "text-signal-success" : isNoToken ? "text-muted-foreground" : "text-signal-danger"}`}>
+        {label}:
+      </span>
+      <span className={`text-xs ${isOk ? "text-signal-success" : isNoToken ? "text-muted-foreground" : "text-signal-danger"}`}>
+        {isOk ? "connected" : status || "unknown"}
+      </span>
     </div>
   );
 }

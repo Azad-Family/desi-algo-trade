@@ -1,17 +1,121 @@
 """AI engine for stock analysis and trade recommendations using Google Gemini.
 
-Uses Gemini 2.5 Flash with Google Search grounding for real-time news
+Uses Gemini models with Google Search grounding for real-time news
 and market context. Technical indicators are computed locally from
 Upstox historical data and injected into the prompt.
+
+Model priority is configured via the GEMINI_MODEL_PRIORITY env var
+(comma-separated). When a model hits a rate limit (429), the engine
+automatically falls back to the next model in the list and applies a
+cooldown before retrying the rate-limited model.
 """
 import logging
 import os
+import time
 from typing import Optional, Dict, Any, List
 import json
 import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MODEL_PRIORITY = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite-preview"]
+MODEL_COOLDOWN_SECONDS = 60
+
+
+def _get_model_priority() -> List[str]:
+    raw = os.environ.get("GEMINI_MODEL_PRIORITY", "")
+    if raw.strip():
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return list(DEFAULT_MODEL_PRIORITY)
+
+
+class _ModelManager:
+    """Tracks rate-limited models and picks the best available one.
+
+    Supports a user-preferred model override stored in MongoDB settings.
+    When set, the preferred model is tried first; on rate-limit, it falls
+    back through the remaining priority list.
+    """
+
+    def __init__(self):
+        self._cooldowns: Dict[str, float] = {}
+        self._preferred: Optional[str] = None
+
+    def set_preferred(self, model: Optional[str]):
+        self._preferred = model
+        logger.info(f"Preferred model set to: {model or '(auto)'}")
+
+    @property
+    def preferred(self) -> Optional[str]:
+        return self._preferred
+
+    def mark_rate_limited(self, model: str):
+        self._cooldowns[model] = time.time()
+        logger.warning(f"Model {model} rate-limited — cooling down for {MODEL_COOLDOWN_SECONDS}s")
+
+    def _ordered_models(self) -> List[str]:
+        """Priority list with user-preferred model promoted to first."""
+        base = _get_model_priority()
+        if self._preferred and self._preferred in base:
+            return [self._preferred] + [m for m in base if m != self._preferred]
+        if self._preferred:
+            return [self._preferred] + base
+        return base
+
+    def get_model(self) -> str:
+        """Return the highest-priority model that is not on cooldown."""
+        now = time.time()
+        for model in self._ordered_models():
+            limited_at = self._cooldowns.get(model)
+            if limited_at is None or (now - limited_at) > MODEL_COOLDOWN_SECONDS:
+                self._cooldowns.pop(model, None)
+                return model
+        fallback = self._ordered_models()[0]
+        logger.warning(f"All models on cooldown, falling back to {fallback}")
+        return fallback
+
+    def current_model(self) -> str:
+        return self.get_model()
+
+
+_model_mgr = _ModelManager()
+
+
+def get_active_model() -> str:
+    """Public accessor for the currently active model name (used by routes/UI)."""
+    return _model_mgr.current_model()
+
+
+def get_available_models() -> List[str]:
+    """Return the full ordered list of models from env config."""
+    return _get_model_priority()
+
+
+def get_preferred_model() -> Optional[str]:
+    """Return the user-selected preferred model, or None for auto."""
+    return _model_mgr.preferred
+
+
+def set_preferred_model(model: Optional[str]):
+    """Set the user-preferred model (None = auto/default priority)."""
+    _model_mgr.set_preferred(model)
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Detect errors that should trigger model fallback (rate limits, model not found, etc.)."""
+    msg = str(exc).lower()
+    if "429" in msg or "resource_exhausted" in msg:
+        return True
+    if "rate" in msg and "limit" in msg:
+        return True
+    if "quota" in msg:
+        return True
+    if "404" in msg or "not_found" in msg or "not found" in msg:
+        return True
+    if "503" in msg or "unavailable" in msg:
+        return True
+    return False
 
 
 def _get_gemini_client():
@@ -23,18 +127,46 @@ def _get_gemini_client():
     return genai.Client(api_key=api_key)
 
 
-SYSTEM_PROMPT = """You are an expert Indian stock market analyst and algorithmic trading strategist 
-specializing in NSE/BSE stocks. You combine quantitative technical analysis with fundamental research 
-and macro-economic context to generate actionable trade signals.
+def _call_gemini(client, prompt: str, config, max_retries: int = 4):
+    """Call Gemini with automatic model fallback on rate-limit errors.
 
-Your analysis must account for:
-- Indian market specifics: FII/DII flows, sector rotation, RBI monetary policy, INR movements
-- Corporate governance and promoter holding patterns
-- Quarterly earnings trends and management guidance
-- Geopolitical risks affecting Indian markets
-- Seasonal patterns in Indian equities
+    Tries the preferred model, and on a 429/quota error switches to
+    the next model in the priority list and retries.
+    """
+    errors = []
+    tried = set()
 
-Always be specific with numbers, price levels, and timeframes. Never hedge excessively."""
+    for attempt in range(max_retries + 1):
+        model = _model_mgr.get_model()
+        if model in tried:
+            # Already failed with this model — skip to avoid tight loops
+            remaining = [m for m in _get_model_priority() if m not in tried]
+            if not remaining:
+                break
+            model = remaining[0]
+
+        tried.add(model)
+        try:
+            logger.info(f"Gemini call → model={model} (attempt {attempt + 1})")
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+            return response
+        except Exception as e:
+            if _is_retryable_error(e):
+                _model_mgr.mark_rate_limited(model)
+                errors.append((model, e))
+                continue
+            raise
+
+    # All retries exhausted
+    models_tried = ", ".join(m for m, _ in errors)
+    raise RuntimeError(f"All Gemini models rate-limited ({models_tried}). Last error: {errors[-1][1]}")
+
+
+from prompts import build_analysis_prompt, build_trade_signal_prompt, build_sell_signal_prompt
 
 
 async def get_ai_stock_analysis(
@@ -45,9 +177,8 @@ async def get_ai_stock_analysis(
     technical_data: str = None
 ) -> Dict[str, Any]:
     """Analyze a stock using Gemini AI with real market data and search grounding.
-    
-    Args:
-        technical_data: Pre-formatted string of technical indicators from indicators.py
+
+    Optimized for daily profit-booking — structured output with actionable levels.
     """
     client = _get_gemini_client()
     if not client:
@@ -62,105 +193,59 @@ async def get_ai_stock_analysis(
     try:
         from google.genai.types import GenerateContentConfig, GoogleSearch, Tool
 
-        data_block = ""
-        if technical_data:
-            data_block = f"""
-REAL MARKET DATA (computed from Upstox historical candles):
-{technical_data}
-"""
-
-        analysis_prompt = f"""{SYSTEM_PROMPT}
-
-Analyze {stock_name} ({stock_symbol}) from the {sector} sector on NSE.
-
-Analysis Type: {analysis_type.upper()}
-{data_block}
-Use your Google Search capability to find the LATEST information about:
-- Recent quarterly results and earnings surprises
-- Latest news, corporate announcements, and management commentary
-- FII/DII activity in this stock and sector
-- RBI policy stance and macro-economic developments affecting {sector}
-- Any recent geopolitical events impacting Indian markets
-- Peer comparison within the {sector} sector
-
-Provide a comprehensive analysis with these sections:
-
-1. **Executive Summary** (2-3 sentences with clear directional bias)
-
-2. **Fundamental Analysis**:
-   - Latest quarterly revenue, profit, and margin trends
-   - Key ratios: P/E, P/B, ROE, Debt/Equity (with sector comparison)
-   - Competitive position and market share trajectory
-   - Management quality and corporate governance
-
-3. **Technical Analysis**:
-   - Current trend direction (short, medium, long-term)
-   - Key support and resistance levels with specific prices
-   - Volume analysis and what it signals
-   - Momentum indicators interpretation (RSI, MACD, Bollinger Bands)
-   - Chart pattern if any (head & shoulders, flag, wedge, etc.)
-
-4. **News & Sentiment**:
-   - Latest material news affecting the stock
-   - Market sentiment and analyst consensus
-   - Any upcoming catalysts (earnings, AGM, dividends, etc.)
-
-5. **Macro Context**:
-   - Sector outlook for {sector}
-   - Impact of current RBI policy and interest rates
-   - FII/DII flow trends
-   - Currency and global macro risks
-
-6. **Risk Factors**: Top 3 specific, quantifiable risks
-
-7. **Trading Recommendation**:
-   - Signal: BUY / SELL / HOLD
-   - Trade Horizon: SHORT_TERM (1-2 weeks) / MEDIUM_TERM (1-3 months) / LONG_TERM (3-12 months)
-   - Horizon Rationale: Why this timeframe
-   - Target Price with rationale
-   - Stop Loss with rationale
-   - Risk-Reward Ratio
-
-8. **Confidence Score**: (0-100) with brief justification
-
-Format with clear **bold headers** for each section."""
+        analysis_prompt = build_analysis_prompt(
+            stock_symbol, stock_name, sector, analysis_type, technical_data or "",
+        )
 
         config = GenerateContentConfig(
             tools=[Tool(google_search=GoogleSearch())],
-            temperature=0.7,
+            temperature=0.4,
         )
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=analysis_prompt,
-            config=config,
-        )
+        response = _call_gemini(client, analysis_prompt, config)
         text_response = response.text
 
         # Parse confidence score
         confidence = 65.0
-        match = re.search(r'confidence[^:]*?[:\s]+(\d+)', text_response.lower())
+        match = re.search(r'confidence[^:]*?[:\s]*(\d+)', text_response.lower())
         if match:
             confidence = float(match.group(1))
 
         # Parse trade horizon
-        trade_horizon = "medium_term"
-        if re.search(r'short[\s_-]?term', text_response.lower()):
-            if re.search(r'(signal|horizon|recommendation)[^.]*short[\s_-]?term', text_response.lower()):
-                trade_horizon = "short_term"
-        if re.search(r'long[\s_-]?term', text_response.lower()):
-            if re.search(r'(signal|horizon|recommendation)[^.]*long[\s_-]?term', text_response.lower()):
-                trade_horizon = "long_term"
+        trade_horizon = "short_term"  # default to short-term for daily profit-booking
+        if re.search(r'(horizon|term)[^.]{0,30}(medium|1-3\s*month)', text_response.lower()):
+            trade_horizon = "medium_term"
+        if re.search(r'(horizon|term)[^.]{0,30}(long|3-12\s*month)', text_response.lower()):
+            trade_horizon = "long_term"
 
-        # Parse key signals from the text
+        # Parse key signals
         key_signals = {}
-        buy_sell = re.search(r'\b(BUY|SELL|HOLD)\b', text_response)
+        buy_sell = re.search(r'\*\*1\.\s*VERDICT\*\*[^[]*\[(BUY|SHORT|SELL|HOLD)\]', text_response)
+        if not buy_sell:
+            buy_sell = re.search(r'\b(BUY|SHORT|SELL|HOLD)\b', text_response)
         if buy_sell:
-            key_signals["action"] = buy_sell.group(1)
+            action_parsed = buy_sell.group(1)
+            # Normalize: SELL in analysis context (unheld stock) means SHORT
+            if action_parsed == "SELL":
+                action_parsed = "SHORT"
+            key_signals["action"] = action_parsed
 
-        if "bullish" in text_response.lower():
+        # Extract target and stop-loss from the verdict line
+        target_match = re.search(r'Target[:\s]*Rs\.?\s*([\d,.]+)', text_response)
+        sl_match = re.search(r'Stop[- ]?Loss[:\s]*Rs\.?\s*([\d,.]+)', text_response)
+        if target_match:
+            key_signals["target_price"] = target_match.group(1).replace(",", "")
+        if sl_match:
+            key_signals["stop_loss"] = sl_match.group(1).replace(",", "")
+
+        # Technical bias from scorecard references
+        if re.search(r'score[:\s]*[+]?\d+.*bullish', text_response.lower()):
             key_signals["technical_bias"] = "bullish"
-        elif "bearish" in text_response.lower():
+        elif re.search(r'score[:\s]*[-]\d+.*bearish', text_response.lower()):
+            key_signals["technical_bias"] = "bearish"
+        elif "bullish" in text_response.lower()[:500]:
+            key_signals["technical_bias"] = "bullish"
+        elif "bearish" in text_response.lower()[:500]:
             key_signals["technical_bias"] = "bearish"
         else:
             key_signals["technical_bias"] = "neutral"
@@ -190,7 +275,7 @@ def _validate_recommendation(data: dict, current_price: float) -> Optional[str]:
     target = data.get("target_price", 0)
     stop = data.get("stop_loss", 0)
 
-    if action not in ("BUY", "SELL", "HOLD"):
+    if action not in ("BUY", "SELL", "SHORT", "HOLD"):
         return f"invalid action: {action}"
 
     if current_price <= 0:
@@ -203,17 +288,18 @@ def _validate_recommendation(data: dict, current_price: float) -> Optional[str]:
             return f"BUY stop-loss ({stop}) must be below current price ({current_price})"
         if target and stop and target <= stop:
             return f"target ({target}) must be above stop-loss ({stop})"
-        # Reject absurd targets (>100% upside) or stop-losses (>50% loss)
         if target and (target / current_price) > 2.0:
             return f"target ({target}) is >100% above current price — unrealistic"
         if stop and (stop / current_price) < 0.5:
             return f"stop-loss ({stop}) is >50% below current price — unrealistic"
 
-    if action == "SELL":
+    if action in ("SELL", "SHORT"):
         if target and target >= current_price:
-            return f"SELL target ({target}) must be below current price ({current_price})"
+            return f"{action} target ({target}) must be below current price ({current_price})"
         if stop and stop <= current_price:
-            return f"SELL stop-loss ({stop}) must be above current price ({current_price})"
+            return f"{action} stop-loss ({stop}) must be above current price ({current_price})"
+        if target and stop and target >= stop:
+            return f"{action} target ({target}) must be below stop-loss ({stop})"
 
     conf = data.get("confidence", 0)
     if not (0 <= conf <= 100):
@@ -265,71 +351,17 @@ async def generate_trade_recommendation(
     try:
         from google.genai.types import GenerateContentConfig, GoogleSearch, Tool
 
-        data_block = ""
-        if technical_data:
-            data_block = f"""
-=== REAL TECHNICAL DATA (computed from Upstox historical candles — treat these numbers as ground truth) ===
-The KEY_NUMBERS block below is a compact numeric summary; use it together with the full analysis for your decision.
-{technical_data}
-"""
-
-        risk_block = f"""
-=== RISK PARAMETERS ===
-Max trade value: Rs.{max_trade_value:,.0f}
-Risk per trade: {risk_per_trade_pct}% of trade value
-"""
-
-        prompt = f"""You are a disciplined algorithmic trading system for Indian NSE stocks.
-You generate precise, data-driven trade signals. You NEVER guess prices — you use the
-REAL TECHNICAL DATA provided below as ground truth for current price, indicators, and
-signal scorecard.
-
-RULES:
-1. Your current_price MUST exactly match the "Current Price" in the data below.
-2. Your target_price and stop_loss MUST fall within the ATR-BASED TRADE CONSTRAINTS 
-   provided below for the chosen horizon. Do NOT set targets or stops outside those ranges.
-3. Respect the SIGNAL SCORECARD: if net bias is BEARISH, do NOT recommend BUY unless you 
-   have very strong fundamental/news reasons (explain them). If net bias is BULLISH, 
-   do NOT recommend SELL unless fundamentals are deteriorating.
-4. For BUY: target must be ABOVE current price, stop-loss must be BELOW current price.
-5. For SELL: target must be BELOW current price, stop-loss must be ABOVE current price.
-6. Do NOT include "quantity" — it is calculated server-side from risk parameters.
-7. Respond with ONLY valid JSON. No markdown fences, no explanation outside the JSON.
-
-{data_block}
-{risk_block}
-
-Use Google Search to check the LATEST news, quarterly results, and market conditions for 
-{stock_name} ({stock_symbol}) in the {sector} sector.
-
-JSON response format:
-{{
-    "action": "BUY" or "SELL" or "HOLD",
-    "trade_horizon": "short_term" or "medium_term" or "long_term",
-    "horizon_rationale": "1-2 sentence rationale for this timeframe",
-    "current_price": {current_price if current_price else "<from data above>"},
-    "target_price": <number within the ATR target range for chosen horizon>,
-    "stop_loss": <number within the ATR stop-loss range for chosen horizon>,
-    "reasoning": "3-4 sentences: what the technicals say + what fundamentals/news say + what the signal scorecard implies",
-    "confidence": <0-100>,
-    "key_signals": {{
-        "technical_bias": "bullish" or "bearish" or "neutral",
-        "fundamental_bias": "bullish" or "bearish" or "neutral",
-        "news_sentiment": "positive" or "negative" or "neutral",
-        "risk_level": "low" or "moderate" or "high"
-    }}
-}}"""
+        prompt = build_trade_signal_prompt(
+            stock_symbol, stock_name, sector, current_price,
+            technical_data or "", max_trade_value, risk_per_trade_pct,
+        )
 
         config = GenerateContentConfig(
             tools=[Tool(google_search=GoogleSearch())],
             temperature=0.3,
         )
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=config,
-        )
+        response = _call_gemini(client, prompt, config)
         text_response = response.text
 
         # Extract the first complete JSON object (non-greedy to avoid grabbing nested braces incorrectly)
@@ -339,6 +371,11 @@ JSON response format:
             return None
 
         data = json.loads(json_match.group())
+
+        # Normalize: AI may still return SELL — treat as SHORT for entry signals
+        if data.get("action") == "SELL":
+            data["action"] = "SHORT"
+            data["product_type"] = "INTRADAY"
 
         if data.get("action") == "HOLD":
             logger.info(f"AI recommends HOLD for {stock_symbol} — skipping")
@@ -357,15 +394,26 @@ JSON response format:
         target_price = float(data.get("target_price", 0))
         stop_loss_val = float(data.get("stop_loss", 0)) if data.get("stop_loss") else None
 
-        # Calculate quantity server-side from risk params
-        quantity = _compute_quantity(effective_price, max_trade_value,
-                                    risk_per_trade_pct, stop_loss_val or 0)
+        action = data["action"]
+        # For SHORT: risk_per_share = stop_loss - current_price (upward risk)
+        if action == "SHORT" and stop_loss_val and stop_loss_val > effective_price:
+            risk_per_share = stop_loss_val - effective_price
+            risk_budget = max_trade_value * (risk_per_trade_pct / 100.0)
+            qty_by_value = int(max_trade_value / effective_price) if effective_price else 1
+            qty_by_risk = int(risk_budget / risk_per_share) if risk_per_share > 0 else qty_by_value
+            quantity = max(1, min(qty_by_value, qty_by_risk))
+        else:
+            quantity = _compute_quantity(effective_price, max_trade_value,
+                                        risk_per_trade_pct, stop_loss_val or 0)
+
+        product_type = "INTRADAY" if action == "SHORT" else data.get("product_type", "DELIVERY")
 
         return {
             "stock_symbol": stock_symbol,
             "stock_name": stock_name,
-            "action": data["action"],
-            "trade_horizon": data.get("trade_horizon", "medium_term"),
+            "action": action,
+            "product_type": product_type,
+            "trade_horizon": data.get("trade_horizon", "short_term" if action == "SHORT" else "medium_term"),
             "horizon_rationale": data.get("horizon_rationale", ""),
             "target_price": target_price,
             "current_price": effective_price,
@@ -466,62 +514,16 @@ Target Hit: {"YES" if target_price and current >= target_price else "NO" if targ
 Stop-Loss Hit: {"YES" if stop_loss and current <= stop_loss else "NO" if stop_loss else "N/A"}
 """
 
-        tech_block = ""
-        if technical_data:
-            tech_block = f"""
-=== CURRENT TECHNICAL DATA (treat as ground truth) ===
-{technical_data}
-"""
-
-        prompt = f"""You are a disciplined algorithmic trading system evaluating whether to SELL 
-an existing portfolio holding. This is NOT a general analysis — you must decide based on 
-the position context, the SIGNAL SCORECARD, and whether the trade horizon has been exhausted.
-
-{position_block}
-{tech_block}
-
-HARD RULES (follow in order):
-1. STOP-LOSS HIT (current price <= stop-loss) → action=SELL, urgency=immediate, sell_quantity=ALL
-2. TARGET HIT (current price >= target) → action=SELL, urgency=immediate, sell_quantity=ALL 
-   (unless SIGNAL SCORECARD is strongly bullish AND momentum is accelerating — then HOLD with revised target)
-3. TRADE HORIZON EXPIRED:
-   - Short-term held >14 days → action=SELL unless P&L > +5% and scorecard is bullish
-   - Medium-term held >90 days → action=SELL unless fundamentals improved materially
-   - Long-term held >365 days → reassess; SELL if thesis is broken
-4. SIGNAL SCORECARD is BEARISH (majority bearish signals) → strong bias toward SELL
-5. P&L worse than -10% → evaluate if thesis is broken; SELL if no catalyst for recovery
-6. If none of the above apply → action=HOLD with tighter revised_stop_loss
-
-Use Google Search to check LATEST news, earnings, and material events for {symbol}.
-
-Respond with ONLY valid JSON (no markdown, no text outside JSON):
-{{
-    "action": "SELL" or "HOLD",
-    "urgency": "immediate" or "soon" or "monitor",
-    "reasoning": "3-4 sentences: reference specific signal scorecard results, P&L, horizon status, and any news",
-    "revised_target": <new target price if HOLD, null if SELL>,
-    "revised_stop_loss": <tighter stop-loss if HOLD, null if SELL>,
-    "sell_quantity": <number of shares to sell, {qty} for full exit, 0 if HOLD>,
-    "confidence": <0-100>,
-    "horizon_assessment": "1-2 sentences on whether original trade thesis is intact and horizon status",
-    "key_signals": {{
-        "technical_bias": "bullish" or "bearish" or "neutral",
-        "fundamental_bias": "bullish" or "bearish" or "neutral",
-        "news_sentiment": "positive" or "negative" or "neutral",
-        "risk_level": "low" or "moderate" or "high"
-    }}
-}}"""
+        prompt = build_sell_signal_prompt(
+            symbol, position_block, technical_data or "", qty,
+        )
 
         config = GenerateContentConfig(
             tools=[Tool(google_search=GoogleSearch())],
             temperature=0.3,
         )
 
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=config,
-        )
+        response = _call_gemini(client, prompt, config)
         text_response = response.text
 
         json_match = re.search(r'\{[\s\S]*\}', text_response)

@@ -9,7 +9,13 @@ import {
   TrendingDown,
   AlertCircle,
   RefreshCw,
-  Edit3
+  Edit3,
+  History,
+  BarChart3,
+  Calendar,
+  ArrowUpRight,
+  ArrowDownRight,
+  ListChecks,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
 import { Button } from "../components/ui/button";
@@ -30,6 +36,15 @@ const STATUS_BADGES = {
   failed: "badge-rejected"
 };
 
+const actionBarColor = (action) =>
+  action === "BUY" ? "bg-signal-success" : action === "SHORT" ? "bg-orange-500" : "bg-signal-danger";
+
+const actionBadgeClass = (action) =>
+  action === "BUY" ? "badge-buy" : action === "SHORT" ? "bg-orange-500/20 text-orange-300 border-orange-500/30" : "badge-sell";
+
+const ActionIcon = ({ action }) =>
+  action === "BUY" ? <TrendingUp className="w-3 h-3 mr-1" /> : <TrendingDown className="w-3 h-3 mr-1" />;
+
 const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
   <motion.tr
     initial={{ opacity: 0, y: 10 }}
@@ -39,7 +54,7 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
   >
     <td className="p-4">
       <div className="flex items-center gap-3">
-        <div className={`w-1 h-12 rounded-full ${rec.action === 'BUY' ? 'bg-signal-success' : 'bg-signal-danger'}`} />
+        <div className={`w-1 h-12 rounded-full ${actionBarColor(rec.action)}`} />
         <div>
           <p className="font-mono font-semibold">{rec.stock_symbol}</p>
           <p className="text-xs text-muted-foreground">{rec.stock_name}</p>
@@ -47,10 +62,15 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
       </div>
     </td>
     <td className="p-4">
-      <Badge className={rec.action === 'BUY' ? 'badge-buy' : 'badge-sell'}>
-        {rec.action === 'BUY' ? <TrendingUp className="w-3 h-3 mr-1" /> : <TrendingDown className="w-3 h-3 mr-1" />}
-        {rec.action}
-      </Badge>
+      <div className="flex items-center gap-1.5">
+        <Badge className={actionBadgeClass(rec.action)}>
+          <ActionIcon action={rec.action} />
+          {rec.action}
+        </Badge>
+        {rec.product_type === "INTRADAY" && (
+          <Badge className="text-[9px] bg-orange-500/20 text-orange-300 border-orange-500/30">INTRADAY</Badge>
+        )}
+      </div>
     </td>
     <td className="p-4 font-mono">{rec.quantity}</td>
     <td className="p-4 font-mono" title="Current / last price when recommendation was generated">
@@ -147,10 +167,12 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
   </motion.tr>
 );
 
-const TABS = { PENDING_BUY: "pending_buy", PENDING_SELL: "pending_sell", HISTORY: "history" };
+const TABS = { PENDING_BUY: "pending_buy", PENDING_SHORT: "pending_short", PENDING_SELL: "pending_sell", HISTORY: "history", TRADE_LOG: "trade_log" };
 
 export default function TradeQueue() {
   const [recommendations, setRecommendations] = useState([]);
+  const [trades, setTrades] = useState([]);
+  const [tradeStats, setTradeStats] = useState({});
   const [tab, setTab] = useState(TABS.PENDING_BUY);
   const [loading, setLoading] = useState(true);
   const [editDialog, setEditDialog] = useState({ open: false, rec: null });
@@ -167,20 +189,40 @@ export default function TradeQueue() {
     }
   };
 
+  const fetchTradeHistory = async () => {
+    try {
+      const [tradesRes, statsRes] = await Promise.all([
+        axios.get(`${API}/trades/history`),
+        axios.get(`${API}/trades/stats`),
+      ]);
+      setTrades(tradesRes.data);
+      setTradeStats(statsRes.data);
+    } catch (error) {
+      console.error("Failed to fetch trade history:", error);
+    }
+  };
+
+  const fetchAll = async () => {
+    setLoading(true);
+    await Promise.all([fetchRecommendations(), fetchTradeHistory()]);
+    setLoading(false);
+  };
+
   useEffect(() => {
-    fetchRecommendations();
+    fetchAll();
   }, []);
 
   const pendingBuy = recommendations.filter((r) => r.status === "pending" && r.action === "BUY");
+  const pendingShort = recommendations.filter((r) => r.status === "pending" && r.action === "SHORT");
   const pendingSell = recommendations.filter((r) => r.status === "pending" && r.action === "SELL");
   const history = recommendations.filter((r) => r.status === "executed" || r.status === "rejected");
 
   const filteredRecs =
-    tab === TABS.PENDING_BUY
-      ? pendingBuy
-      : tab === TABS.PENDING_SELL
-        ? pendingSell
-        : history;
+    tab === TABS.PENDING_BUY ? pendingBuy
+    : tab === TABS.PENDING_SHORT ? pendingShort
+    : tab === TABS.PENDING_SELL ? pendingSell
+    : tab === TABS.HISTORY ? history
+    : [];
 
   const handleApprove = async (rec) => {
     try {
@@ -238,18 +280,72 @@ export default function TradeQueue() {
     <div data-testid="trade-queue-page" className="space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="font-heading text-3xl font-bold tracking-tight">Trade Queue</h1>
-          <p className="text-muted-foreground mt-1">Review and approve AI-generated trade recommendations</p>
+        <div className="flex items-center gap-3">
+          <div>
+            <h1 className="font-heading text-3xl font-bold tracking-tight flex items-center gap-3">
+              <ListChecks className="w-8 h-8 text-muted-foreground" />
+              Trades
+            </h1>
+            <p className="text-muted-foreground mt-1">Signals, approvals, and execution history</p>
+          </div>
+          {tradeStats.trade_mode && (
+            <Badge className={`text-xs px-2 py-1 ${
+              tradeStats.trade_mode === 'live'
+                ? 'bg-signal-success/20 text-signal-success border-signal-success/30'
+                : 'bg-signal-warning/20 text-signal-warning border-signal-warning/30'
+            }`}>
+              {tradeStats.trade_mode === 'live' ? 'LIVE' : 'SANDBOX'}
+            </Badge>
+          )}
         </div>
-        <Button onClick={fetchRecommendations} variant="outline" data-testid="refresh-queue-btn">
+        <Button onClick={fetchAll} variant="outline" data-testid="refresh-queue-btn">
           <RefreshCw className="w-4 h-4 mr-2" />
           Refresh
         </Button>
       </div>
 
-      {/* BUY / SELL / History tabs */}
-      <div className="flex items-center gap-2 border-b border-border-subtle pb-2">
+      {/* Trade Stats Bar */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Card className="bg-surface-primary border-border-subtle">
+          <CardContent className="p-3 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-secondary"><BarChart3 className="w-4 h-4 text-muted-foreground" /></div>
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Total Trades</p>
+              <p className="font-mono font-semibold">{tradeStats.total_trades || 0}</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="bg-surface-primary border-border-subtle">
+          <CardContent className="p-3 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-signal-success/10"><TrendingUp className="w-4 h-4 text-signal-success" /></div>
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Buy Trades</p>
+              <p className="font-mono font-semibold text-signal-success">{tradeStats.buy_trades || 0}</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="bg-surface-primary border-border-subtle">
+          <CardContent className="p-3 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-signal-danger/10"><TrendingDown className="w-4 h-4 text-signal-danger" /></div>
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Sell Trades</p>
+              <p className="font-mono font-semibold text-signal-danger">{tradeStats.sell_trades || 0}</p>
+            </div>
+          </CardContent>
+        </Card>
+        <Card className="bg-surface-primary border-border-subtle">
+          <CardContent className="p-3 flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-secondary"><BarChart3 className="w-4 h-4 text-muted-foreground" /></div>
+            <div>
+              <p className="text-[10px] text-muted-foreground uppercase tracking-wider">Total Traded</p>
+              <p className="font-mono font-semibold">₹{(tradeStats.total_traded_value || 0).toLocaleString()}</p>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex items-center gap-2 border-b border-border-subtle pb-2 flex-wrap">
         <Button
           variant={tab === TABS.PENDING_BUY ? "default" : "outline"}
           size="sm"
@@ -259,6 +355,16 @@ export default function TradeQueue() {
         >
           <TrendingUp className="w-4 h-4 mr-1" />
           Pending BUY ({pendingBuy.length})
+        </Button>
+        <Button
+          variant={tab === TABS.PENDING_SHORT ? "default" : "outline"}
+          size="sm"
+          onClick={() => setTab(TABS.PENDING_SHORT)}
+          className={tab === TABS.PENDING_SHORT ? "bg-orange-500 hover:bg-orange-500/90" : ""}
+          data-testid="tab-pending-short"
+        >
+          <TrendingDown className="w-4 h-4 mr-1" />
+          Pending SHORT ({pendingShort.length})
         </Button>
         <Button
           variant={tab === TABS.PENDING_SELL ? "default" : "outline"}
@@ -277,11 +383,101 @@ export default function TradeQueue() {
           data-testid="tab-history"
         >
           <Clock className="w-4 h-4 mr-1" />
-          History ({history.length})
+          Rec History ({history.length})
+        </Button>
+        <Button
+          variant={tab === TABS.TRADE_LOG ? "default" : "outline"}
+          size="sm"
+          onClick={() => setTab(TABS.TRADE_LOG)}
+          data-testid="tab-trade-log"
+        >
+          <History className="w-4 h-4 mr-1" />
+          Executed ({trades.length})
         </Button>
       </div>
 
-      {/* Recommendations Table */}
+      {/* Trade Log Tab */}
+      {tab === TABS.TRADE_LOG ? (
+        <Card className="bg-surface-primary border-border-subtle">
+          <CardContent className="p-0">
+            {trades.length === 0 ? (
+              <div className="text-center py-16">
+                <BarChart3 className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+                <p className="text-muted-foreground">No trades executed yet</p>
+                <p className="text-sm text-muted-foreground mt-1">Approved trades will appear here</p>
+              </div>
+            ) : (
+              <ScrollArea className="max-h-[600px]">
+                <table className="w-full trading-table">
+                  <thead>
+                    <tr className="border-b border-border-subtle">
+                      <th className="text-left p-4">Date/Time</th>
+                      <th className="text-left p-4">Stock</th>
+                      <th className="text-left p-4">Action</th>
+                      <th className="text-left p-4">Qty</th>
+                      <th className="text-left p-4">Price</th>
+                      <th className="text-left p-4">Total Value</th>
+                      <th className="text-left p-4">Order ID</th>
+                      <th className="text-left p-4">Mode</th>
+                      <th className="text-left p-4">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {trades.map((trade, idx) => (
+                      <motion.tr
+                        key={trade.id}
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: idx * 0.03 }}
+                        className="border-b border-border-subtle/50 hover:bg-surface-secondary/50"
+                      >
+                        <td className="p-4">
+                          <div className="flex items-center gap-2">
+                            <Calendar className="w-4 h-4 text-muted-foreground" />
+                            <div>
+                              <p className="font-mono text-sm">{new Date(trade.executed_at).toLocaleDateString()}</p>
+                              <p className="text-xs text-muted-foreground">{new Date(trade.executed_at).toLocaleTimeString()}</p>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="p-4">
+                          <p className="font-mono font-semibold">{trade.stock_symbol}</p>
+                          <p className="text-xs text-muted-foreground">{trade.stock_name}</p>
+                        </td>
+                        <td className="p-4">
+                          <Badge className={trade.action === "BUY" ? "badge-buy" : "badge-sell"}>
+                            {trade.action === "BUY" ? <ArrowUpRight className="w-3 h-3 mr-1" /> : <ArrowDownRight className="w-3 h-3 mr-1" />}
+                            {trade.action}
+                          </Badge>
+                        </td>
+                        <td className="p-4 font-mono">{trade.quantity}</td>
+                        <td className="p-4 font-mono">₹{trade.price?.toLocaleString()}</td>
+                        <td className="p-4 font-mono font-semibold">₹{trade.total_value?.toLocaleString()}</td>
+                        <td className="p-4">
+                          <code className="text-xs bg-surface-secondary px-2 py-1 rounded">{trade.order_id || "-"}</code>
+                        </td>
+                        <td className="p-4">
+                          <Badge className={`text-[10px] ${
+                            trade.trade_mode === "live" ? "bg-signal-success/20 text-signal-success border-signal-success/30" :
+                            trade.trade_mode === "sandbox" ? "bg-signal-warning/20 text-signal-warning border-signal-warning/30" :
+                            "bg-zinc-500/20 text-zinc-400 border-zinc-500/30"
+                          }`}>
+                            {trade.trade_mode === "live" ? "LIVE" : trade.trade_mode === "sandbox" ? "SANDBOX" : "SIMULATED"}
+                          </Badge>
+                        </td>
+                        <td className="p-4">
+                          <Badge className="badge-approved">{trade.status}</Badge>
+                        </td>
+                      </motion.tr>
+                    ))}
+                  </tbody>
+                </table>
+              </ScrollArea>
+            )}
+          </CardContent>
+        </Card>
+      ) : (
+      /* Recommendations Table */
       <Card className="bg-surface-primary border-border-subtle">
         <CardContent className="p-0">
           {filteredRecs.length === 0 ? (
@@ -289,6 +485,7 @@ export default function TradeQueue() {
               <AlertCircle className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
               <p className="text-muted-foreground">
                 {tab === TABS.PENDING_BUY && "No pending BUY recommendations"}
+                {tab === TABS.PENDING_SHORT && "No pending SHORT (intraday) recommendations"}
                 {tab === TABS.PENDING_SELL && "No pending SELL recommendations"}
                 {tab === TABS.HISTORY && "No executed or rejected trades in history"}
               </p>
@@ -332,6 +529,7 @@ export default function TradeQueue() {
           )}
         </CardContent>
       </Card>
+      )}
 
       {/* Edit Dialog */}
       <Dialog open={editDialog.open} onOpenChange={(open) => setEditDialog({ open, rec: editDialog.rec })}>
@@ -364,6 +562,18 @@ export default function TradeQueue() {
               />
             </div>
             
+            {editDialog.rec?.action === "SHORT" && (
+              <div className="p-3 bg-orange-500/10 border border-orange-500/30 rounded-lg">
+                <p className="text-sm font-semibold text-orange-300 flex items-center gap-2">
+                  <AlertCircle className="w-4 h-4" />
+                  Intraday Short-Sell
+                </p>
+                <p className="text-xs text-orange-200/80 mt-1">
+                  This position MUST be squared off before 3:15 PM IST. Upstox will auto-square-off
+                  any open intraday positions at market close.
+                </p>
+              </div>
+            )}
             <div className="p-3 bg-surface-secondary rounded-lg">
               <p className="text-sm text-muted-foreground mb-2">AI Reasoning:</p>
               <p className="text-sm">{editDialog.rec?.ai_reasoning}</p>

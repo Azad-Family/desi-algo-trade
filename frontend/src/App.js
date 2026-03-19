@@ -1,24 +1,22 @@
-import { BrowserRouter, Routes, Route, NavLink, useLocation } from "react-router-dom";
+import { BrowserRouter, Routes, Route, NavLink, useLocation, Navigate } from "react-router-dom";
 import { useState, useEffect } from "react";
 import axios from "axios";
 import { Toaster } from "./components/ui/sonner";
 import "@/App.css";
-import Dashboard from "./pages/Dashboard";
-import StockUniverse from "./pages/StockUniverse";
+import AgentChat from "./pages/AgentChat";
 import TradeQueue from "./pages/TradeQueue";
 import Portfolio from "./pages/Portfolio";
-import TradeHistory from "./pages/TradeHistory";
 import Settings from "./pages/Settings";
 import AIResearch from "./pages/AIResearch";
+import Sandbox from "./pages/Sandbox";
 import { 
-  LayoutDashboard, 
-  Layers, 
   Brain, 
   ListChecks, 
   Wallet, 
-  History, 
   Settings as SettingsIcon,
-  TrendingUp
+  TrendingUp,
+  MessageSquare,
+  FlaskConical,
 } from "lucide-react";
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || "http://localhost:8000";
@@ -57,12 +55,11 @@ const Sidebar = () => {
   }, []);
   
   const navItems = [
-    { path: "/", icon: LayoutDashboard, label: "Dashboard" },
-    { path: "/stocks", icon: Layers, label: "Stock Universe" },
-    { path: "/research", icon: Brain, label: "AI Research" },
-    { path: "/queue", icon: ListChecks, label: "Trade Queue" },
+    { path: "/", icon: MessageSquare, label: "Agent" },
+    { path: "/research", icon: Brain, label: "Research" },
+    { path: "/trades", icon: ListChecks, label: "Trades" },
     { path: "/portfolio", icon: Wallet, label: "Portfolio" },
-    { path: "/history", icon: History, label: "Trade History" },
+    { path: "/sandbox", icon: FlaskConical, label: "Sandbox" },
     { path: "/settings", icon: SettingsIcon, label: "Settings" },
   ];
 
@@ -74,7 +71,7 @@ const Sidebar = () => {
             <TrendingUp className="w-5 h-5 text-signal-success" />
           </div>
           <div className="hidden lg:block">
-            <h1 className="font-heading font-bold text-lg text-foreground">AlgoTrade</h1>
+            <h1 className="font-heading font-bold text-lg text-foreground">Desi Algo Trade</h1>
             <p className="text-[10px] text-muted-foreground uppercase tracking-wider">AI Trading Agent</p>
           </div>
         </div>
@@ -133,13 +130,17 @@ function App() {
         <Sidebar />
         <main className="main-content">
           <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/stocks" element={<StockUniverse />} />
+            <Route path="/" element={<AgentChat />} />
             <Route path="/research" element={<AIResearch />} />
-            <Route path="/queue" element={<TradeQueue />} />
+            <Route path="/trades" element={<TradeQueue />} />
             <Route path="/portfolio" element={<Portfolio />} />
-            <Route path="/history" element={<TradeHistory />} />
+            <Route path="/sandbox" element={<Sandbox />} />
             <Route path="/settings" element={<Settings />} />
+            {/* Redirects for old routes */}
+            <Route path="/dashboard" element={<Navigate to="/portfolio" replace />} />
+            <Route path="/stocks" element={<Navigate to="/research" replace />} />
+            <Route path="/queue" element={<Navigate to="/trades" replace />} />
+            <Route path="/history" element={<Navigate to="/trades" replace />} />
           </Routes>
         </main>
         <Toaster position="bottom-right" richColors />

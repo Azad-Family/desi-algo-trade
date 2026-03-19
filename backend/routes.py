@@ -12,7 +12,10 @@ from models import (
     Stock, TradeRecommendation, TradeApproval, Portfolio, TradeHistory, 
     Settings, AIAnalysisRequest, AIAnalysisResponse
 )
-from ai_engine import get_ai_stock_analysis, generate_trade_recommendation, generate_portfolio_sell_signal
+from ai_engine import (
+    get_ai_stock_analysis, generate_trade_recommendation, generate_portfolio_sell_signal,
+    get_active_model, get_available_models, get_preferred_model, set_preferred_model,
+)
 from trading import UpstoxClient
 from indicators import compute_indicators, format_indicators_for_prompt, format_technical_numbers_for_ai
 from stock_init import initialize_stocks
@@ -24,6 +27,11 @@ upstox_client = UpstoxClient()
 
 # Create router
 api_router = APIRouter(prefix="/api")
+
+
+def _current_trade_mode() -> str:
+    """Return 'sandbox' or 'live' based on current Upstox configuration."""
+    return "sandbox" if upstox_client.sandbox else "live"
 
 
 async def _get_technical_data(symbol: str) -> tuple:
@@ -85,7 +93,7 @@ async def health_check():
 async def get_stocks():
     """Get all stocks in the universe"""
     try:
-        stocks = await db.stocks.find({}, {"_id": 0}).to_list(100)
+        stocks = await db.stocks.find({}, {"_id": 0}).to_list(500)
         if not stocks:
             raise HTTPException(status_code=404, detail="No stocks found. Please initialize the stock universe.")
         return stocks
@@ -99,7 +107,7 @@ async def get_stocks():
 @api_router.get("/stocks/sector/{sector}")
 async def get_stocks_by_sector(sector: str):
     """Get stocks filtered by sector"""
-    stocks = await db.stocks.find({"sector": sector}, {"_id": 0}).to_list(100)
+    stocks = await db.stocks.find({"sector": sector}, {"_id": 0}).to_list(500)
     return stocks
 
 
@@ -159,6 +167,27 @@ async def debug_upstox_config():
     }
 
 
+@api_router.get("/debug/ai-config")
+async def debug_ai_config():
+    """Show current AI model configuration and active model."""
+    from ai_engine import _get_model_priority, _model_mgr, MODEL_COOLDOWN_SECONDS
+    import time
+    now = time.time()
+    models = _get_model_priority()
+    cooldowns = {}
+    for m in models:
+        cd = _model_mgr._cooldowns.get(m)
+        if cd:
+            remaining = max(0, MODEL_COOLDOWN_SECONDS - (now - cd))
+            cooldowns[m] = f"{remaining:.0f}s remaining" if remaining > 0 else "expired"
+    return {
+        "active_model": get_active_model(),
+        "model_priority": models,
+        "cooldowns": cooldowns,
+        "gemini_key_set": bool(os.environ.get("GOOGLE_GEMINI_KEY")),
+    }
+
+
 @api_router.get("/market/debug-quote/{symbol}")
 async def debug_quote(symbol: str):
     """Debug endpoint: show raw Upstox API response for a single stock"""
@@ -193,7 +222,7 @@ async def refresh_stock_prices():
     try:
         logger.info("📍 /api/stocks/refresh endpoint called")
         # Get all stock symbols
-        stocks = await db.stocks.find({}, {"symbol": 1}).to_list(100)
+        stocks = await db.stocks.find({}, {"symbol": 1}).to_list(500)
         symbols = [s["symbol"] for s in stocks]
         logger.info(f"📦 Found {len(symbols)} stocks in database")
         
@@ -234,9 +263,10 @@ async def refresh_stock_prices():
                 if update_result.modified_count > 0:
                     updated_count += 1
         
-        # Also update portfolio holdings with the latest prices
+        # Also update portfolio holdings with the latest prices (current mode only)
         portfolio_updated = 0
-        holdings = await db.portfolio.find({}, {"_id": 0}).to_list(100)
+        current_mode = _current_trade_mode()
+        holdings = await db.portfolio.find({"trade_mode": current_mode}, {"_id": 0}).to_list(100)
         for h in holdings:
             sym = h["stock_symbol"]
             price_data = quotes.get(sym, {})
@@ -254,7 +284,7 @@ async def refresh_stock_prices():
                 pnl = current_val - invested
                 pnl_pct = (pnl / invested * 100) if invested > 0 else 0.0
                 await db.portfolio.update_one(
-                    {"stock_symbol": sym},
+                    {"stock_symbol": sym, "trade_mode": current_mode},
                     {"$set": {
                         "current_price": ltp,
                         "current_value": round(current_val, 2),
@@ -282,40 +312,121 @@ async def refresh_stock_prices():
 # ============ AI ANALYSIS ROUTES ============
 @api_router.post("/ai/analyze", response_model=AIAnalysisResponse)
 async def analyze_stock(request: AIAnalysisRequest):
-    """Run AI analysis on a stock with real technical data and search grounding"""
-    stock = await db.stocks.find_one({"symbol": request.stock_symbol.upper()}, {"_id": 0})
+    """Portfolio-aware AI analysis that auto-generates trade signals.
+
+    - Stock NOT in portfolio → ENTRY mode (BUY signal only)
+    - Stock IN portfolio → EXIT mode (SELL signal only)
+    """
+    symbol = request.stock_symbol.upper()
+    stock = await db.stocks.find_one({"symbol": symbol}, {"_id": 0})
     if not stock:
         raise HTTPException(status_code=404, detail="Stock not found")
-    
+
+    trade_mode = _current_trade_mode()
+    holding = await db.portfolio.find_one({"stock_symbol": symbol, "trade_mode": trade_mode}, {"_id": 0})
+    mode = "exit" if holding else "entry"
+
     try:
-        technical_data, _ = await _get_technical_data(stock["symbol"])
-        
+        technical_data, indicators_raw = await _get_technical_data(symbol)
+
         analysis = await get_ai_stock_analysis(
-            stock["symbol"],
+            symbol,
             stock["name"],
             stock["sector"],
             request.analysis_type,
-            technical_data=technical_data
+            technical_data=technical_data,
         )
-        
+
+        # Persist analysis
         analysis_doc = {
             "id": str(uuid_lib.uuid4()),
-            "stock_symbol": stock["symbol"],
+            "stock_symbol": symbol,
             "analysis": analysis["analysis"],
             "confidence_score": analysis["confidence_score"],
             "analysis_type": request.analysis_type,
             "trade_horizon": analysis.get("trade_horizon"),
             "key_signals": analysis.get("key_signals", {}),
-            "created_at": datetime.now(timezone.utc).isoformat()
+            "mode": mode,
+            "source": "research_page",
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         await db.analysis_history.insert_one(analysis_doc)
-        
+
+        # Auto-generate trade signal
+        signal_generated = None
+        key_signals = analysis.get("key_signals", {})
+        action = key_signals.get("action", "HOLD")
+
+        # Normalize: AI analysis may say SELL for bearish — map to SHORT for unheld stocks
+        effective_action = action
+        if not holding and action == "SELL":
+            effective_action = "SHORT"
+
+        if holding and action in ("SELL", "SHORT"):
+            # EXIT: sell existing holdings (delivery)
+            sell_rec = await generate_portfolio_sell_signal(
+                holding=holding, technical_data=technical_data,
+            )
+            if sell_rec and sell_rec.get("action") == "SELL":
+                trade_rec = TradeRecommendation(
+                    stock_symbol=symbol,
+                    stock_name=stock["name"],
+                    sector=stock.get("sector", ""),
+                    action="SELL",
+                    quantity=sell_rec.get("sell_quantity", holding.get("quantity", 0)),
+                    target_price=float(key_signals.get("target_price", 0) or 0),
+                    current_price=indicators_raw.get("current_price", 0) if indicators_raw else 0,
+                    stop_loss=float(key_signals.get("stop_loss", 0) or 0),
+                    ai_reasoning=sell_rec.get("reasoning", "")[:500],
+                    confidence_score=sell_rec.get("confidence", analysis["confidence_score"]),
+                    trade_horizon=analysis.get("trade_horizon", "short_term"),
+                    key_signals=sell_rec.get("key_signals", key_signals),
+                    product_type="DELIVERY",
+                    trade_mode=trade_mode,
+                )
+                await db.trade_recommendations.insert_one(trade_rec.model_dump())
+                signal_generated = {"action": "SELL", "id": trade_rec.id}
+        elif not holding and effective_action in ("BUY", "SHORT"):
+            # ENTRY: BUY (delivery) or SHORT (intraday)
+            max_val, risk_pct = await _get_risk_settings()
+            rec = await generate_trade_recommendation(
+                symbol, stock["name"], stock["sector"],
+                technical_data=technical_data,
+                indicators_raw=indicators_raw,
+                max_trade_value=max_val,
+                risk_per_trade_pct=risk_pct,
+            )
+            if rec and rec["action"] in ("BUY", "SHORT"):
+                trade_rec = TradeRecommendation(
+                    stock_symbol=rec["stock_symbol"],
+                    stock_name=rec["stock_name"],
+                    sector=stock.get("sector", ""),
+                    action=rec["action"],
+                    quantity=rec["quantity"],
+                    target_price=rec["target_price"],
+                    current_price=rec["current_price"],
+                    stop_loss=rec.get("stop_loss"),
+                    ai_reasoning=rec["ai_reasoning"],
+                    confidence_score=rec["confidence_score"],
+                    trade_horizon=rec.get("trade_horizon", "short_term"),
+                    horizon_rationale=rec.get("horizon_rationale"),
+                    key_signals=rec.get("key_signals", {}),
+                    product_type=rec.get("product_type", "DELIVERY"),
+                    trade_mode=trade_mode,
+                )
+                await db.trade_recommendations.insert_one(trade_rec.model_dump())
+                signal_generated = {"action": rec["action"], "id": trade_rec.id}
+
         return AIAnalysisResponse(
-            stock_symbol=stock["symbol"],
+            stock_symbol=symbol,
             analysis=analysis["analysis"],
             confidence_score=analysis["confidence_score"],
             trade_horizon=analysis.get("trade_horizon"),
-            key_signals=analysis.get("key_signals", {}),
+            key_signals={
+                **analysis.get("key_signals", {}),
+                "mode": mode,
+                "signal_generated": signal_generated,
+            },
         )
     except Exception as e:
         logger.error(f"AI analysis failed: {e}")
@@ -348,6 +459,16 @@ async def get_latest_analysis_any():
     return doc
 
 
+@api_router.get("/ai/analysis/history")
+async def get_analysis_history(limit: int = 20):
+    """Return the most recent analyses across all stocks."""
+    docs = await db.analysis_history.find(
+        {},
+        {"_id": 0, "analysis": 0},
+    ).sort("created_at", -1).to_list(limit)
+    return docs
+
+
 @api_router.post("/ai/generate-recommendation/{symbol}")
 async def generate_recommendation(symbol: str):
     """Generate an AI trade recommendation for a stock with real data"""
@@ -375,6 +496,7 @@ async def generate_recommendation(symbol: str):
         trade_rec = TradeRecommendation(
             stock_symbol=recommendation["stock_symbol"],
             stock_name=recommendation["stock_name"],
+            sector=stock.get("sector", ""),
             action=recommendation["action"],
             quantity=recommendation["quantity"],
             target_price=recommendation["target_price"],
@@ -385,6 +507,7 @@ async def generate_recommendation(symbol: str):
             trade_horizon=recommendation.get("trade_horizon", "medium_term"),
             horizon_rationale=recommendation.get("horizon_rationale"),
             key_signals=recommendation.get("key_signals", {}),
+            trade_mode=_current_trade_mode(),
         )
         
         await db.trade_recommendations.insert_one(trade_rec.model_dump())
@@ -397,30 +520,30 @@ async def generate_recommendation(symbol: str):
 
 
 # How many stocks to scan per "Scan All" run (to limit API/time). Picked by symbol order for determinism.
-SCAN_ALL_BATCH_SIZE = 10
-
-
 @api_router.post("/ai/scan-all")
 async def scan_all_stocks():
-    """Run AI scan on a batch of stocks and generate BUY recommendations.
-    
-    Does not delete any existing recommendations. Adds new BUY recommendations
-    to the queue. Reports when the scan completed (scanned_at).
-    
-    Stock selection: first SCAN_ALL_BATCH_SIZE stocks when ordered by sector
-    then symbol, so the same set is scanned each time until the universe changes.
+    """Run AI scan on ALL stocks in the universe.
+
+    Deletes all previous pending recommendations (BUY, SHORT, and SELL),
+    then scans every stock and generates fresh trade signals.
     """
-    stocks = await db.stocks.find({}, {"_id": 0}).to_list(100)
-    # Deterministic order: by sector, then symbol (same 10 every time)
+    mode = _current_trade_mode()
+
+    # Clear pending recommendations for the current mode before fresh scan
+    delete_result = await db.trade_recommendations.delete_many({"status": "pending", "trade_mode": mode})
+    deleted_count = delete_result.deleted_count
+    logger.info(f"Scan All [{mode}]: deleted {deleted_count} pending recommendations before fresh scan")
+
+    stocks = await db.stocks.find({}, {"_id": 0}).to_list(500)
     stocks_sorted = sorted(stocks, key=lambda s: (s.get("sector", ""), s.get("symbol", "")))
-    to_scan = stocks_sorted[:SCAN_ALL_BATCH_SIZE]
-    scanned_symbols = [s["symbol"] for s in to_scan]
 
     max_val, risk_pct = await _get_risk_settings()
     generated = 0
     scanned = 0
 
-    for stock in to_scan:
+    scan_time = datetime.now(timezone.utc).isoformat()
+
+    for stock in stocks_sorted:
         scanned += 1
         try:
             technical_data, indicators_raw = await _get_technical_data(stock["symbol"])
@@ -434,10 +557,31 @@ async def scan_all_stocks():
                 max_trade_value=max_val,
                 risk_per_trade_pct=risk_pct,
             )
-            if recommendation:
+
+            # Persist analysis record so it shows in AI Research history
+            action = recommendation["action"] if recommendation else "HOLD"
+            analysis_doc = {
+                "id": str(uuid_lib.uuid4()),
+                "stock_symbol": stock["symbol"],
+                "analysis": recommendation.get("ai_reasoning", "No actionable signal") if recommendation else "No actionable signal",
+                "confidence_score": recommendation.get("confidence_score", 0) if recommendation else 0,
+                "analysis_type": "hybrid",
+                "trade_horizon": recommendation.get("trade_horizon") if recommendation else None,
+                "key_signals": {
+                    "action": action,
+                    **(recommendation.get("key_signals", {}) if recommendation else {}),
+                },
+                "mode": "entry",
+                "source": "scan_all",
+                "created_at": scan_time,
+            }
+            await db.analysis_history.insert_one(analysis_doc)
+
+            if recommendation and recommendation["action"] in ("BUY", "SHORT"):
                 trade_rec = TradeRecommendation(
                     stock_symbol=recommendation["stock_symbol"],
                     stock_name=recommendation["stock_name"],
+                    sector=stock.get("sector", ""),
                     action=recommendation["action"],
                     quantity=recommendation["quantity"],
                     target_price=recommendation["target_price"],
@@ -448,6 +592,8 @@ async def scan_all_stocks():
                     trade_horizon=recommendation.get("trade_horizon", "medium_term"),
                     horizon_rationale=recommendation.get("horizon_rationale"),
                     key_signals=recommendation.get("key_signals", {}),
+                    product_type=recommendation.get("product_type", "DELIVERY"),
+                    trade_mode=mode,
                 )
                 await db.trade_recommendations.insert_one(trade_rec.model_dump())
                 generated += 1
@@ -456,13 +602,13 @@ async def scan_all_stocks():
             logger.error(f"Error scanning {stock['symbol']}: {e}")
 
     scanned_at = datetime.now(timezone.utc).isoformat()
-    logger.info(f"Scan All completed at {scanned_at}: {generated} new BUY recommendations from {scanned} stocks ({scanned_symbols})")
+    logger.info(f"Scan All completed at {scanned_at}: {generated} signals from {scanned} stocks")
 
     return {
-        "message": f"Scan complete: {generated} new recommendations from {scanned} stocks. No recommendations were deleted.",
+        "message": f"Scan complete: {generated} new signals from {scanned} stocks. {deleted_count} old pending recommendations cleared.",
         "generated": generated,
         "scanned": scanned,
-        "scanned_symbols": scanned_symbols,
+        "deleted": deleted_count,
         "scanned_at": scanned_at,
     }
 
@@ -470,21 +616,23 @@ async def scan_all_stocks():
 # ============ TRADE RECOMMENDATIONS ROUTES ============
 @api_router.get("/recommendations")
 async def get_recommendations(status: Optional[str] = None, action: Optional[str] = None):
-    """Get trade recommendations. Filter by status (pending/executed/rejected) and/or action (BUY/SELL)."""
-    query = {}
+    """Get trade recommendations for the current mode (sandbox/live)."""
+    mode = _current_trade_mode()
+    query = {"trade_mode": mode}
     if status:
         query["status"] = status
-    if action and action.upper() in ("BUY", "SELL"):
+    if action and action.upper() in ("BUY", "SELL", "SHORT"):
         query["action"] = action.upper()
-    recommendations = await db.trade_recommendations.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
+    recommendations = await db.trade_recommendations.find(query, {"_id": 0}).sort("created_at", -1).to_list(200)
     return recommendations
 
 
 @api_router.get("/recommendations/pending")
 async def get_pending_recommendations(action: Optional[str] = None):
-    """Get pending trade recommendations awaiting approval. Optional action=BUY or action=SELL."""
-    query = {"status": "pending"}
-    if action and action.upper() in ("BUY", "SELL"):
+    """Get pending trade recommendations for the current mode. Optional action=BUY, SELL, or SHORT."""
+    mode = _current_trade_mode()
+    query = {"status": "pending", "trade_mode": mode}
+    if action and action.upper() in ("BUY", "SELL", "SHORT"):
         query["action"] = action.upper()
     recommendations = await db.trade_recommendations.find(query, {"_id": 0}).sort("created_at", -1).to_list(100)
     return recommendations
@@ -521,12 +669,21 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
         if approval.approved:
             quantity = approval.modified_quantity or rec["quantity"]
             price = approval.modified_price or rec["target_price"]
-            
+
+            # SHORT trades: send as SELL with product=I (Intraday) to Upstox
+            upstox_action = rec["action"]
+            product = rec.get("product_type", "DELIVERY")
+            upstox_product = "I" if product == "INTRADAY" else "D"
+            if rec["action"] == "SHORT":
+                upstox_action = "SELL"
+                upstox_product = "I"
+
             order_result = await upstox_client.place_order(
                 rec["stock_symbol"],
-                rec["action"],
+                upstox_action,
                 quantity,
-                price
+                price,
+                product_type=upstox_product,
             )
             
             trade_mode = order_result.get("trade_mode", "simulated")
@@ -555,9 +712,14 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
             )
             await db.trade_history.insert_one(trade_history.model_dump())
             
+            sector = rec.get("sector", "")
+            if not sector:
+                stock_doc = await db.stocks.find_one({"symbol": rec["stock_symbol"]}, {"sector": 1})
+                sector = stock_doc.get("sector", "Unknown") if stock_doc else "Unknown"
+
             await update_portfolio(
                 rec["stock_symbol"], rec["stock_name"], rec["action"], quantity, price,
-                rec.get("sector", ""),
+                sector,
                 trade_mode=trade_mode,
                 trade_horizon=rec.get("trade_horizon"),
                 target_price=rec.get("target_price"),
@@ -577,8 +739,20 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
 # ============ PORTFOLIO ROUTES ============
 @api_router.get("/portfolio")
 async def get_portfolio():
-    """Get current portfolio holdings"""
-    holdings = await db.portfolio.find({}, {"_id": 0}).to_list(100)
+    """Get portfolio holdings for the current mode (sandbox/live)."""
+    mode = _current_trade_mode()
+    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
+
+    # Backfill missing sectors from stocks collection
+    for h in holdings:
+        if not h.get("sector"):
+            stock_doc = await db.stocks.find_one({"symbol": h["stock_symbol"]}, {"sector": 1})
+            if stock_doc and stock_doc.get("sector"):
+                h["sector"] = stock_doc["sector"]
+                await db.portfolio.update_one(
+                    {"stock_symbol": h["stock_symbol"], "trade_mode": mode},
+                    {"$set": {"sector": stock_doc["sector"]}},
+                )
     
     # Calculate totals
     total_invested = sum(h.get("invested_value", 0) for h in holdings)
@@ -594,14 +768,17 @@ async def get_portfolio():
             "total_pnl": round(total_pnl, 2),
             "total_pnl_percent": round(total_pnl_percent, 2),
             "holdings_count": len(holdings)
-        }
+        },
+        "trade_mode": mode,
     }
 
 
 @api_router.get("/portfolio/sector-breakdown")
 async def get_portfolio_sector_breakdown():
-    """Get portfolio breakdown by sector"""
+    """Get portfolio breakdown by sector for current mode."""
+    mode = _current_trade_mode()
     pipeline = [
+        {"$match": {"trade_mode": mode}},
         {"$group": {
             "_id": "$sector",
             "total_value": {"$sum": "$current_value"},
@@ -615,11 +792,12 @@ async def get_portfolio_sector_breakdown():
 
 @api_router.post("/portfolio/refresh-prices")
 async def refresh_portfolio_prices():
-    """Update current prices for all portfolio holdings using latest stock data.
+    """Update current prices for portfolio holdings in the current mode.
     
     Should be called after /stocks/refresh so the stocks collection has fresh prices.
     """
-    holdings = await db.portfolio.find({}, {"_id": 0}).to_list(100)
+    mode = _current_trade_mode()
+    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
     if not holdings:
         return {"message": "Portfolio is empty", "updated": 0}
 
@@ -644,7 +822,7 @@ async def refresh_portfolio_prices():
             pnl_pct = (pnl / invested * 100) if invested > 0 else 0.0
 
             await db.portfolio.update_one(
-                {"stock_symbol": sym},
+                {"stock_symbol": sym, "trade_mode": mode},
                 {"$set": {
                     "current_price": ltp,
                     "current_value": round(current_val, 2),
@@ -656,6 +834,58 @@ async def refresh_portfolio_prices():
             updated += 1
 
     return {"message": f"Updated prices for {updated}/{len(holdings)} holdings", "updated": updated}
+
+
+@api_router.post("/portfolio/{symbol}/sell")
+async def sell_holding(symbol: str, quantity: Optional[int] = None):
+    """Directly sell a portfolio holding (full or partial) in the current mode.
+    Places an order via Upstox, updates portfolio and trade history."""
+    mode = _current_trade_mode()
+    holding = await db.portfolio.find_one({"stock_symbol": symbol.upper(), "trade_mode": mode}, {"_id": 0})
+    if not holding:
+        raise HTTPException(status_code=404, detail=f"No holding found for {symbol}")
+
+    sell_qty = quantity or holding["quantity"]
+    if sell_qty > holding["quantity"]:
+        raise HTTPException(status_code=400, detail=f"Cannot sell {sell_qty}, only {holding['quantity']} held")
+
+    price = holding.get("current_price", 0)
+    if not price:
+        quotes = await upstox_client.get_batch_quotes([symbol.upper()])
+        price = float(quotes.get(symbol.upper(), {}).get("ltp", 0))
+
+    order_result = await upstox_client.place_order(symbol.upper(), "SELL", sell_qty, price)
+    trade_mode = order_result.get("trade_mode", "simulated")
+
+    trade = TradeHistory(
+        stock_symbol=symbol.upper(),
+        stock_name=holding.get("stock_name", symbol.upper()),
+        action="SELL",
+        quantity=sell_qty,
+        price=price,
+        total_value=round(sell_qty * price, 2),
+        status="executed",
+        order_id=order_result.get("order_id", "MANUAL"),
+        trade_mode=trade_mode,
+    )
+    await db.trade_history.insert_one(trade.model_dump())
+    await update_portfolio(
+        symbol=symbol.upper(),
+        name=holding.get("stock_name", symbol.upper()),
+        action="SELL",
+        quantity=sell_qty,
+        price=price,
+        sector=holding.get("sector", ""),
+        trade_mode=trade_mode,
+    )
+
+    return {
+        "message": f"Sold {sell_qty} shares of {symbol.upper()}",
+        "order_id": order_result.get("order_id"),
+        "trade_mode": trade_mode,
+        "price": price,
+        "total_value": round(sell_qty * price, 2),
+    }
 
 
 @api_router.post("/portfolio/scan-sells")
@@ -673,7 +903,8 @@ async def scan_portfolio_for_sells():
     Returns sell signals and also creates trade recommendations for SELL actions.
     Does not delete any existing recommendations.
     """
-    holdings = await db.portfolio.find({}, {"_id": 0}).to_list(100)
+    mode = _current_trade_mode()
+    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
     if not holdings:
         return {"message": "Portfolio is empty", "signals": [], "sell_count": 0}
 
@@ -707,6 +938,7 @@ async def scan_portfolio_for_sells():
                     trade_rec = TradeRecommendation(
                         stock_symbol=signal["stock_symbol"],
                         stock_name=signal["stock_name"],
+                        sector=holding.get("sector", ""),
                         action="SELL",
                         quantity=sell_qty,
                         target_price=holding.get("current_price", 0),
@@ -716,6 +948,7 @@ async def scan_portfolio_for_sells():
                         confidence_score=signal.get("confidence", 60),
                         trade_horizon=holding.get("trade_horizon", "medium_term"),
                         key_signals=signal.get("key_signals", {}),
+                        trade_mode=mode,
                     )
                     await db.trade_recommendations.insert_one(trade_rec.model_dump())
 
@@ -743,20 +976,23 @@ async def scan_portfolio_for_sells():
 # ============ TRADE HISTORY ROUTES ============
 @api_router.get("/trades/history")
 async def get_trade_history(limit: int = 50):
-    """Get trade execution history"""
-    trades = await db.trade_history.find({}, {"_id": 0}).sort("executed_at", -1).to_list(limit)
+    """Get trade execution history for the current mode."""
+    mode = _current_trade_mode()
+    trades = await db.trade_history.find({"trade_mode": mode}, {"_id": 0}).sort("executed_at", -1).to_list(limit)
     return trades
 
 
 @api_router.get("/trades/stats")
 async def get_trade_stats():
-    """Get trading statistics"""
-    total_trades = await db.trade_history.count_documents({})
-    buy_trades = await db.trade_history.count_documents({"action": "BUY"})
-    sell_trades = await db.trade_history.count_documents({"action": "SELL"})
+    """Get trading statistics for the current mode."""
+    mode = _current_trade_mode()
+    mode_filter = {"trade_mode": mode}
+    total_trades = await db.trade_history.count_documents(mode_filter)
+    buy_trades = await db.trade_history.count_documents({**mode_filter, "action": "BUY"})
+    sell_trades = await db.trade_history.count_documents({**mode_filter, "action": "SELL"})
     
-    # Calculate total traded value
     pipeline = [
+        {"$match": mode_filter},
         {"$group": {"_id": None, "total_value": {"$sum": "$total_value"}}}
     ]
     result = await db.trade_history.aggregate(pipeline).to_list(1)
@@ -766,7 +1002,8 @@ async def get_trade_stats():
         "total_trades": total_trades,
         "buy_trades": buy_trades,
         "sell_trades": sell_trades,
-        "total_traded_value": round(total_value, 2)
+        "total_traded_value": round(total_value, 2),
+        "trade_mode": mode,
     }
 
 
@@ -806,6 +1043,33 @@ async def update_settings(settings: Settings):
     return {"message": "Settings updated successfully"}
 
 
+@api_router.get("/settings/models")
+async def get_models():
+    """Return available Gemini models and which one is currently preferred."""
+    return {
+        "available": get_available_models(),
+        "preferred": get_preferred_model(),
+        "active": get_active_model(),
+    }
+
+
+@api_router.post("/settings/model")
+async def set_model(body: dict):
+    """Set the preferred Gemini model. Pass {"model": "gemini-2.5-flash"} or {"model": null} for auto."""
+    model = body.get("model")
+    available = get_available_models()
+    if model and model not in available:
+        raise HTTPException(status_code=400, detail=f"Unknown model. Available: {available}")
+
+    set_preferred_model(model)
+    await db.settings.update_one(
+        {"id": "main_settings"},
+        {"$set": {"gemini_model": model, "updated_at": datetime.now(timezone.utc).isoformat()}},
+        upsert=True,
+    )
+    return {"message": f"Model set to {model or 'auto'}", "active": get_active_model()}
+
+
 @api_router.get("/settings/upstox-status")
 async def get_upstox_status():
     """Read-only status of Upstox integration.
@@ -829,21 +1093,54 @@ async def get_upstox_status():
         "env_file_hint": "Update UPSTOX_ACCESS_TOKEN and UPSTOX_SANDBOX_ACCESS_TOKEN in backend/.env, then restart the server.",
     }
 
-    # Quick connectivity check — try hitting a lightweight API
+    import httpx
+
+    # Market data connectivity — uses live token against live API (v2)
+    # This will 401 if the live token is expired, which is expected in sandbox-only setups
     if live_token:
         try:
-            import httpx
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
-                    f"{upstox_client.base_url}/market/status/exchange",
+                    "https://api.upstox.com/v2/market/status/NSE",
                     headers={"Authorization": f"Bearer {live_token}", "Accept": "application/json"},
                     timeout=5.0,
                 )
-                status["market_data_connectivity"] = "ok" if resp.status_code == 200 else f"HTTP {resp.status_code}"
+                if resp.status_code == 200:
+                    status["market_data_connectivity"] = "ok"
+                elif resp.status_code == 401:
+                    status["market_data_connectivity"] = "token expired — regenerate UPSTOX_ACCESS_TOKEN"
+                else:
+                    status["market_data_connectivity"] = f"HTTP {resp.status_code}"
         except Exception as e:
             status["market_data_connectivity"] = f"error: {e}"
     else:
         status["market_data_connectivity"] = "no token"
+
+    # Order API connectivity — v3 only has POST endpoints (place/cancel),
+    # so we check with the v2 order book GET endpoint on the matching base.
+    if order_token:
+        order_check_url = (
+            "https://api-sandbox.upstox.com/v2/order/retrieve-all" if sandbox
+            else "https://api.upstox.com/v2/order/retrieve-all"
+        )
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    order_check_url,
+                    headers={"Authorization": f"Bearer {order_token}", "Accept": "application/json"},
+                    timeout=5.0,
+                )
+                if resp.status_code == 200:
+                    status["order_connectivity"] = "ok"
+                elif resp.status_code == 401:
+                    token_label = "UPSTOX_SANDBOX_ACCESS_TOKEN" if sandbox else "UPSTOX_ACCESS_TOKEN"
+                    status["order_connectivity"] = f"token expired — regenerate {token_label}"
+                else:
+                    status["order_connectivity"] = f"HTTP {resp.status_code}"
+        except Exception as e:
+            status["order_connectivity"] = f"error: {e}"
+    else:
+        status["order_connectivity"] = "no token"
 
     return status
 
@@ -851,20 +1148,19 @@ async def get_upstox_status():
 # ============ DASHBOARD ROUTES ============
 @api_router.get("/dashboard/stats")
 async def get_dashboard_stats():
-    """Get dashboard overview stats"""
-    # Portfolio summary
-    portfolio = await db.portfolio.find({}, {"_id": 0}).to_list(100)
+    """Get dashboard overview stats for the current mode."""
+    mode = _current_trade_mode()
+    mode_filter = {"trade_mode": mode}
+
+    portfolio = await db.portfolio.find(mode_filter, {"_id": 0}).to_list(100)
     total_invested = sum(h.get("invested_value", 0) for h in portfolio)
     total_current = sum(h.get("current_value", 0) for h in portfolio)
     
-    # Pending recommendations
-    pending_count = await db.trade_recommendations.count_documents({"status": "pending"})
+    pending_count = await db.trade_recommendations.count_documents({"status": "pending", **mode_filter})
     
-    # Today's trades
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-    today_trades = await db.trade_history.count_documents({"executed_at": {"$gte": today_start}})
+    today_trades = await db.trade_history.count_documents({"executed_at": {"$gte": today_start}, **mode_filter})
     
-    # Stock universe count
     stock_count = await db.stocks.count_documents({})
     
     return {
@@ -875,7 +1171,8 @@ async def get_dashboard_stats():
         "pending_recommendations": pending_count,
         "today_trades": today_trades,
         "total_stocks": stock_count,
-        "holdings_count": len(portfolio)
+        "holdings_count": len(portfolio),
+        "trade_mode": mode,
     }
 
 
@@ -885,8 +1182,11 @@ async def update_portfolio(
     trade_mode: str = "simulated", trade_horizon: str = None, target_price: float = None,
     stop_loss: float = None, recommendation_id: str = None,
 ):
-    """Update portfolio after a trade, preserving trade context for sell signal generation."""
-    existing = await db.portfolio.find_one({"stock_symbol": symbol}, {"_id": 0})
+    """Update portfolio after a trade, preserving trade context for sell signal generation.
+    Queries are scoped by trade_mode so the same stock can exist in both live and sandbox portfolios.
+    """
+    query = {"stock_symbol": symbol, "trade_mode": trade_mode}
+    existing = await db.portfolio.find_one(query, {"_id": 0})
     
     if action == "BUY":
         if existing:
@@ -910,10 +1210,7 @@ async def update_portfolio(
                 update_fields["stop_loss"] = stop_loss
             if recommendation_id:
                 update_fields["ai_recommendation_id"] = recommendation_id
-            await db.portfolio.update_one(
-                {"stock_symbol": symbol},
-                {"$set": update_fields}
-            )
+            await db.portfolio.update_one(query, {"$set": update_fields})
         else:
             portfolio = Portfolio(
                 stock_symbol=symbol,
@@ -938,11 +1235,11 @@ async def update_portfolio(
     elif action == "SELL" and existing:
         new_qty = existing["quantity"] - quantity
         if new_qty <= 0:
-            await db.portfolio.delete_one({"stock_symbol": symbol})
+            await db.portfolio.delete_one(query)
         else:
             new_invested = new_qty * existing["avg_buy_price"]
             await db.portfolio.update_one(
-                {"stock_symbol": symbol},
+                query,
                 {"$set": {
                     "quantity": new_qty,
                     "invested_value": new_invested,
