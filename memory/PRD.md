@@ -19,7 +19,7 @@ Build an AI-powered trading agent for Indian stocks (NSE) that combines technica
 
 ## Core Requirements
 
-1. 59 NSE stocks across 10 sectors (IT, Banking, Pharma, Auto, FMCG, Energy, Metal, Infrastructure, Telecom, Consumer)
+1. 125 NSE stocks + 11 ETFs across 22 sectors (IT, Banking, Pharma, Auto, FMCG, Energy, Metal, Infrastructure, Telecom, Consumer, Financial Services, Healthcare, Cement, Capital Goods, Defence, Chemicals, Green Energy, Shipping, Logistics, Realty, Conglomerate, ETF)
 2. Conversational AI agent as the primary interface
 3. AI-powered stock research (fundamental + momentum + news analysis)
 4. 20+ technical indicators with weighted signal scorecard
@@ -35,14 +35,14 @@ Build an AI-powered trading agent for Indian stocks (NSE) that combines technica
 ### Completed
 
 - [x] **Conversational AI Agent**: Chat-first interface with intent classification (briefing, discover, analyze, signal, approve, reject, portfolio, sell_scan, question). Rich message blocks (text, stock cards, analysis, trade signals, suggested prompts). Session persistence.
-- [x] **Stock Universe**: 59 stocks across 10 sectors with live price refresh via Upstox.
+- [x] **Stock Universe**: 125 stocks + 11 ETFs across 22 sectors with live price refresh via Upstox.
 - [x] **AI Research**: Per-stock analysis with Gemini 2.5 Flash + Google Search grounding. Fundamental, technical, news, and macro analysis. Auto-generates trade signals from analysis.
 - [x] **Technical Indicators**: 20+ indicators — Supertrend, Pivot Points, CPR, Fibonacci, EMA/SMA (9/21/50/200), RSI, MACD, Bollinger Bands, ATR, OBV, ADX, Stochastic, candlestick patterns. Weighted signal scorecard.
 - [x] **Trade Signals**: BUY/SELL/SHORT with target price, stop-loss, trade horizon (short/medium/long term), confidence score, key signals, product type (delivery/intraday).
 - [x] **Approval Workflow**: Pending signals in trade queue. Approve (with quantity/price modification), edit, or reject. Agent-based approval via chat.
 - [x] **Portfolio Management**: Mode-scoped holdings with P&L, sector allocation pie chart, AI sell scan, direct sell with quantity control, target/stop-loss tracking, days held.
 - [x] **Mode-Aware Data**: All portfolio, recommendations, and trade history scoped to current Upstox mode (sandbox/live). Same stock can exist in both modes independently. UI shows LIVE/SANDBOX badge.
-- [x] **Trade Execution**: Upstox live and sandbox order placement. Simulated fallback when no token available.
+- [x] **Trade Execution**: Upstox live and sandbox order placement. Simulated fallback when no token available. Pre-trade fund validation in live mode.
 - [x] **Trade History**: Executed trade log with stats (total trades, buy/sell counts, total traded value). Mode-scoped.
 - [x] **Sandbox Paper Trading**: Virtual ₹1L capital account. CNC and intraday trade types. Automated AI-driven entry/exit. Win rate and strategy insights.
 - [x] **Screener**: Fast technical pre-screen (momentum, volume, Supertrend, Bollinger, pivots/Fibonacci) to rank stocks before expensive AI calls.
@@ -52,6 +52,8 @@ Build an AI-powered trading agent for Indian stocks (NSE) that combines technica
 - [x] **Settings**: Risk parameters (max trade value, risk per trade %), Gemini model selection, Upstox connectivity status with token validation.
 - [x] **Consolidated UI**: 6 pages — Agent (home), Research, Trades, Portfolio, Sandbox, Settings. Dark theme trading terminal aesthetic.
 - [x] **Instrument Resolution**: Dynamic NSE instrument master download with ISIN-based key resolution and symbol overrides.
+- [x] **Live Portfolio from Upstox**: In live mode, holdings, positions, and available funds are fetched directly from Upstox DEMAT account APIs. Portfolio page shows Available Funds card. AI analysis checks Upstox holdings for ENTRY/EXIT determination. Pre-trade fund validation rejects orders exceeding available margin.
+- [x] **Two-Phase Scan**: "Scan All" uses a fast technical screener (parallel, no AI) to filter 125 stocks to top-N candidates, then runs deep AI analysis only on filtered candidates.
 
 ### UI Pages
 
@@ -71,6 +73,8 @@ Build an AI-powered trading agent for Indian stocks (NSE) that combines technica
 - Upstox OAuth flow for seamless token refresh (currently manual token rotation)
 - WebSocket real-time price streaming (currently polling)
 - Multi-timeframe analysis (intraday + daily + weekly candles in single analysis)
+- Market holiday awareness for scheduler (currently only skips weekends)
+- Strategy feedback loop — AI learns from sandbox backtesting performance
 
 ### P2 (Medium Priority)
 

@@ -69,10 +69,14 @@ Frontend loads → reads `REACT_APP_BACKEND_URL` → calls `/api/health` and `/a
 
 1. **POST /api/ai/analyze** (body: `stock_symbol`, optional `analysis_type`).
 2. Load stock from `db.stocks` (name, sector).
-3. Determine mode: check if stock is in portfolio (mode-scoped) → "exit" mode if held, "entry" mode if not.
+3. **Determine mode** (portfolio-aware):
+   - **Live mode**: Check Upstox `get_holdings()` to see if the user actually holds the stock in their DEMAT account.
+   - **Sandbox mode**: Check local `db.portfolio` for the stock with matching `trade_mode`.
+   - If held → "exit" mode (SELL analysis). If not held → "entry" mode (BUY/SHORT analysis).
 4. **Technical data**: `_get_technical_data(symbol)`:
    - `get_candles_cached(symbol)` — fetch from candle cache (MongoDB) or Upstox if stale.
    - `compute_indicators(candles)` → raw dict with 20+ indicators.
+   - **Patch live price**: Fetch real-time LTP from Upstox, replace candle close with live price in indicators.
    - `format_indicators_for_prompt(indicators)` + `format_technical_numbers_for_ai(indicators)` → formatted strings for prompt.
 5. **AI**: `get_ai_stock_analysis(symbol, name, sector, analysis_type, technical_data)`:
    - Gemini with Google Search grounding; prompt includes technical data and asks for analysis, signal, trade horizon, confidence, key signals.
@@ -93,16 +97,16 @@ Frontend loads → reads `REACT_APP_BACKEND_URL` → calls `/api/health` and `/a
 
 1. **POST /api/ai/scan-all**.
 2. Determine current mode. **Clean queue**: Delete all pending recommendations for current mode.
-3. Load risk settings; load all stocks sorted by sector/symbol.
-4. **For each stock**:
-   - `_get_technical_data(symbol)` via candle cache.
+3. **Phase 1 — Fast Screener** (~30s): `screen_all_stocks()` screens all 125 stocks in parallel using technical indicators (no AI calls). Ranks by momentum score and produces buy + short candidate lists.
+4. **Phase 2 — Deep AI Analysis** (~5 min): Takes top 15 buy + top 5 short candidates from the screener:
+   - `_get_technical_data(symbol)` via candle cache + live LTP patch.
    - `generate_trade_recommendation(...)` with technical data and risk params.
-   - Persist analysis to `analysis_history`.
+   - Persist analysis to `analysis_history` (source: `"scan_all"`).
    - If BUY or SHORT: create `TradeRecommendation` tagged with current mode, insert into DB.
    - 2-second delay between stocks to avoid Gemini rate limits.
-5. **Response**: Counts (generated, scanned, deleted).
+5. **Response**: Counts (screened, analyzed, signals generated).
 
-**Frontend**: Navigates to Trades page after scan completes.
+**Frontend**: Fetches updated history, navigates to Trades page after scan completes. Axios timeout set to 10 minutes.
 
 ---
 
@@ -120,7 +124,8 @@ Frontend loads → reads `REACT_APP_BACKEND_URL` → calls `/api/health` and `/a
 3. Update status to `approved` or `rejected`.
 4. **If approved**:
    - Apply quantity/price modifications if provided.
-   - **Execute**: `upstox_client.place_order(symbol, action, quantity, price)` → returns `trade_mode` (live/sandbox/simulated).
+   - **Pre-trade fund check** (live mode only): Fetch available margin via `upstox_client.get_funds_and_margin()`. If trade value exceeds available margin, return HTTP 400 error — order is not placed.
+   - **Execute**: `upstox_client.place_order(symbol, action, quantity, price, product_type)` → returns `trade_mode` (live/sandbox/simulated). SHORT trades are sent as SELL with product=I (Intraday).
    - Update recommendation: status `executed`, `trade_mode`, `executed_at`, `executed_price`.
    - **Trade history**: Insert into `db.trade_history` with `trade_mode`.
    - **Portfolio**: `update_portfolio(...)` — mode-aware lookup/insert. If BUY: add or update holding. If SELL: reduce or remove holding.
@@ -132,14 +137,20 @@ Frontend loads → reads `REACT_APP_BACKEND_URL` → calls `/api/health` and `/a
 
 ## 7. Portfolio and Sell Scan
 
-**View portfolio** (mode-scoped)
+**View portfolio** (mode-aware data sourcing)
 
-- **GET /api/portfolio** → Holdings filtered by current mode + summary (total invested, current, P&L) + `trade_mode` field.
-- **GET /api/portfolio/sector-breakdown** → Aggregation by sector, current mode only.
+- **GET /api/portfolio**:
+  - **Live mode** → Fetches real holdings from Upstox (`get_holdings()` for DEMAT, `get_positions()` for intraday). Maps Upstox trading symbols back to our internal symbols. Returns holdings with live P&L, sector data, and `source: "upstox"`.
+  - **Sandbox mode** → Reads from local `db.portfolio` filtered by `trade_mode`. Backfills missing sectors from `stocks` collection.
+  - Both return: holdings array + summary (total invested, current, P&L, holdings count) + `trade_mode` field.
+- **GET /api/portfolio/sector-breakdown** → Aggregation by sector. Live mode aggregates from Upstox holdings; sandbox from local DB.
+- **GET /api/funds** → Available trading margin. Live mode calls `get_funds_and_margin()` from Upstox. Sandbox returns virtual capital from sandbox account.
 
 **Refresh portfolio prices**
 
-- **POST /api/portfolio/refresh-prices** → Batch quote for current-mode holdings; update current_price, current_value, pnl, pnl_percent.
+- **POST /api/portfolio/refresh-prices**:
+  - **Live mode** → No-op (prices come directly from Upstox).
+  - **Sandbox mode** → Batch quote for sandbox-mode holdings; update current_price, current_value, pnl, pnl_percent.
 
 **Direct sell**
 
@@ -148,7 +159,7 @@ Frontend loads → reads `REACT_APP_BACKEND_URL` → calls `/api/health` and `/a
 **Scan for sell signals**
 
 1. **POST /api/portfolio/scan-sells**.
-2. Load current-mode holdings; refresh prices.
+2. Load holdings — Upstox in live mode, local DB in sandbox.
 3. **For each holding**:
    - `_get_technical_data(symbol)`.
    - `generate_portfolio_sell_signal(holding, technical_data)` — Gemini evaluates: horizon expired? Target/stop hit? Technicals bearish?
@@ -239,8 +250,9 @@ All core data is partitioned by `trade_mode` (determined by `UPSTOX_USE_SANDBOX`
 
 - **Write**: New recommendations tagged with mode. Portfolio entries scoped by mode. Trade history records include mode from order result.
 - **Read**: All GET endpoints filter by current mode. Dashboard stats scoped by mode.
+- **Live data sourcing**: In live mode, portfolio/holdings/funds are fetched from Upstox APIs (not local DB). AI analysis checks Upstox holdings for ENTRY/EXIT determination. Pre-trade fund validation uses Upstox margin API.
 - **Isolation**: Same stock can exist in both sandbox and live portfolios independently.
-- **UI indicator**: Portfolio and Trades pages show a LIVE/SANDBOX badge.
+- **UI indicator**: Portfolio and Trades pages show a LIVE/SANDBOX badge. Available Funds card shows Upstox balance (live) or virtual capital (sandbox).
 
 ---
 
@@ -271,9 +283,10 @@ All core data is partitioned by `trade_mode` (determined by `UPSTOX_USE_SANDBOX`
 | Browse stocks | GET /stocks | stocks collection |
 | Refresh prices | POST /stocks/refresh | Upstox batch quotes → stocks + portfolio update |
 | Run AI analysis | POST /ai/analyze | candle_cache → indicators → Gemini → analysis_history + trade_recommendations |
-| Scan all stocks | POST /ai/scan-all | Delete pending recs → candle_cache → indicators → Gemini → trade_recommendations |
-| Approve trade | POST /recommendations/{id}/approve | trade_recommendations update → Upstox place_order → trade_history + portfolio |
-| View portfolio | GET /portfolio | portfolio (mode-filtered) |
+| Scan all stocks | POST /ai/scan-all | Delete pending recs → screener (parallel) → top-N → candle_cache → Gemini → analysis_history + trade_recommendations |
+| Approve trade | POST /recommendations/{id}/approve | Fund check (live) → trade_recommendations update → Upstox place_order → trade_history + portfolio |
+| View portfolio | GET /portfolio | Live: Upstox holdings+positions; Sandbox: portfolio (mode-filtered) |
+| Check funds | GET /funds | Live: Upstox funds API; Sandbox: sandbox_account |
 | AI sell scan | POST /portfolio/scan-sells | portfolio → candle_cache → Gemini → trade_recommendations |
 | Direct sell | POST /portfolio/{symbol}/sell | portfolio → Upstox order → trade_history + portfolio |
 | Run screener | POST /sandbox/screener/run | candle_cache → indicators → screener_results |

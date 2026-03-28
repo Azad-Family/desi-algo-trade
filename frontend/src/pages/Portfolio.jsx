@@ -207,6 +207,7 @@ export default function Portfolio() {
   const [portfolio, setPortfolio] = useState({ holdings: [], summary: {} });
   const [sectorBreakdown, setSectorBreakdown] = useState([]);
   const [dashStats, setDashStats] = useState({});
+  const [funds, setFunds] = useState(null);
   const [sellSignals, setSellSignals] = useState({});
   const [loading, setLoading] = useState(true);
   const [scanning, setScanning] = useState(false);
@@ -215,14 +216,16 @@ export default function Portfolio() {
 
   const fetchData = async () => {
     try {
-      const [portfolioRes, sectorRes, statsRes] = await Promise.all([
+      const [portfolioRes, sectorRes, statsRes, fundsRes] = await Promise.all([
         axios.get(`${API}/portfolio`),
         axios.get(`${API}/portfolio/sector-breakdown`),
         axios.get(`${API}/dashboard/stats`),
+        axios.get(`${API}/funds`).catch(() => ({ data: null })),
       ]);
       setPortfolio(portfolioRes.data);
       setSectorBreakdown(sectorRes.data);
       setDashStats(statsRes.data);
+      setFunds(fundsRes.data);
     } catch (error) {
       console.error("Failed to fetch portfolio:", error);
     } finally {
@@ -334,7 +337,7 @@ export default function Portfolio() {
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-3">
         <Card className="bg-surface-primary border-border-subtle">
           <CardContent className="p-4">
             <p className="data-label mb-1 text-[10px]">Total Invested</p>
@@ -370,6 +373,21 @@ export default function Portfolio() {
             <p className="data-label mb-1 text-[10px]">Holdings</p>
             <p className="data-value text-lg font-mono">{portfolio.summary?.holdings_count || 0}</p>
             <p className="text-xs text-muted-foreground mt-0.5">Active positions</p>
+          </CardContent>
+        </Card>
+        <Card className={`border-border-subtle ${
+          funds?.available_margin > 0 ? 'bg-signal-success/5' : 'bg-surface-primary'
+        }`}>
+          <CardContent className="p-4">
+            <p className="data-label mb-1 text-[10px] flex items-center gap-1">
+              <Wallet className="w-3 h-3" /> Available Funds
+            </p>
+            <p className="data-value text-lg font-mono">
+              ₹{(funds?.available_margin || 0).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+            </p>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              {funds?.source === 'upstox' ? 'Upstox live' : funds?.source === 'sandbox' ? 'Virtual' : '—'}
+            </p>
           </CardContent>
         </Card>
         <Card

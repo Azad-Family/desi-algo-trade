@@ -13,7 +13,8 @@ AI-powered stock research, trade signals, and execution for NSE, with a conversa
 - **Trade signals**: BUY/SELL/SHORT with target, stop-loss, trade horizon (short/medium/long term), confidence score, and key signal breakdown.
 - **Human-in-the-loop**: Pending signals in the trade queue; approve (with optional quantity/price tweaks), edit, or reject. Approved orders executed via Upstox.
 - **Mode-aware data**: All portfolio, recommendations, and trade history are scoped to the current Upstox mode — sandbox data stays separate from live data.
-- **Portfolio**: Holdings with P&L, sector allocation chart, AI sell scan, direct sell with quantity control.
+- **Live portfolio from Upstox**: In live mode, portfolio holdings, positions, and available funds are fetched directly from your Upstox DEMAT account (not local DB). Pre-trade fund validation prevents orders exceeding available margin.
+- **Portfolio**: Holdings with P&L, sector allocation chart, available funds card, AI sell scan, direct sell with quantity control.
 - **Sandbox**: Virtual ₹1L paper trading account with CNC/intraday support, automated AI-driven entry/exit, and strategy insights.
 - **Scheduler**: Automated daily screener → AI analysis → sandbox execution pipeline with intraday monitoring and square-off.
 - **Screener**: Fast technical pre-screen (momentum, volume, Supertrend, Bollinger, pivots) to rank candidates before expensive AI calls.
@@ -170,7 +171,7 @@ desi-algo-trade/
 | Market          | `GET /market/status`                                                                                              |
 | AI              | `POST /ai/analyze`, `GET /ai/analysis/latest/{symbol}`, `POST /ai/scan-all`                                       |
 | Recommendations | `GET /recommendations`, `GET /recommendations/pending`, `POST /recommendations/{id}/approve`                      |
-| Portfolio       | `GET /portfolio`, `POST /portfolio/refresh-prices`, `POST /portfolio/scan-sells`, `POST /portfolio/{symbol}/sell` |
+| Portfolio       | `GET /portfolio`, `GET /funds`, `POST /portfolio/refresh-prices`, `POST /portfolio/scan-sells`, `POST /portfolio/{symbol}/sell` |
 | Trades          | `GET /trades/history`, `GET /trades/stats`                                                                        |
 | Settings        | `GET /settings`, `POST /settings`, `GET /settings/upstox-status`, `GET/POST /settings/model`                      |
 | Dashboard       | `GET /dashboard/stats`                                                                                            |
@@ -217,6 +218,8 @@ Every trade, recommendation, and portfolio entry carries a `trade_mode` field:
 
 
 All data endpoints (portfolio, recommendations, trade history, dashboard stats) are **mode-scoped** — when running in sandbox mode, only sandbox data is shown; when in live mode, only live data is shown. The current mode is determined by `UPSTOX_USE_SANDBOX` in `.env`.
+
+**Live mode specifics**: In live mode, portfolio data (holdings, positions, funds) is fetched directly from Upstox APIs rather than the local MongoDB. Pre-trade fund validation checks available margin before placing orders. Sandbox mode continues to use the local DB for its virtual portfolio.
 
 ---
 

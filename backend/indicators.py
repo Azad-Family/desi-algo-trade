@@ -579,7 +579,11 @@ def format_indicators_for_prompt(indicators: Dict[str, Any]) -> str:
 
     # --- Price & Gap ---
     lines.append("=== PRICE DATA ===")
-    lines.append(f"Current Price: Rs.{indicators.get('current_price', 'N/A')}")
+    live_ltp = indicators.get("live_ltp")
+    if live_ltp:
+        lines.append(f"Current Price (LIVE): Rs.{indicators.get('current_price', 'N/A')} (intraday {indicators.get('live_change_pct', 0):+.2f}% from prev close Rs.{indicators.get('prev_day_close', 'N/A')})")
+    else:
+        lines.append(f"Current Price (last close): Rs.{indicators.get('current_price', 'N/A')}")
     lines.append(f"Day OHLC: O={indicators.get('day_open')} H={indicators.get('day_high')} L={indicators.get('day_low')} C={indicators.get('current_price')}")
     lines.append(f"Previous Day: O={indicators.get('prev_open')} H={indicators.get('prev_high')} L={indicators.get('prev_low')} C={indicators.get('prev_close')}")
     lines.append(f"Gap: Rs.{indicators.get('gap', 0)} ({indicators.get('gap_pct', 0)}%) — {indicators.get('gap_type', 'N/A')}")
@@ -710,9 +714,15 @@ def format_technical_numbers_for_ai(indicators: Dict[str, Any]) -> str:
     scorecard = compute_signal_scorecard(indicators)
     constraints = compute_trade_constraints(indicators)
 
+    live_ltp = indicators.get("live_ltp")
+    prev_day_close = indicators.get("prev_day_close")
+    live_line = ""
+    if live_ltp and prev_day_close:
+        live_line = f"live_ltp={live_ltp} (prev_close={prev_day_close}, intraday_change={indicators.get('live_change_pct')}%)"
     lines = [
         "KEY_NUMBERS (anchor your decision on these):",
-        f"current_price={indicators.get('current_price')}",
+        f"current_price={indicators.get('current_price')}" + (f"  <<LIVE>>" if live_ltp else "  (last candle close)"),
+        live_line,
         f"prev_close={indicators.get('prev_close')} gap={indicators.get('gap')} gap_type={indicators.get('gap_type')}",
         f"rsi_14={indicators.get('rsi_14')} rsi_signal={indicators.get('rsi_signal')} rsi_divergence={indicators.get('rsi_divergence', 'none')}",
         f"macd_crossover={indicators.get('macd_crossover')} macd_momentum={indicators.get('macd_momentum')}",
@@ -728,6 +738,7 @@ def format_technical_numbers_for_ai(indicators: Dict[str, Any]) -> str:
         f"atr_14={indicators.get('atr_14')} atr_pct={indicators.get('atr_pct')}",
         f"change_1d={indicators.get('change_1d')} change_5d={indicators.get('change_5d')} change_20d={indicators.get('change_20d')}",
     ]
+    lines = [l for l in lines if l]
     if constraints:
         st = constraints.get("short_term", {})
         mt = constraints.get("medium_term", {})

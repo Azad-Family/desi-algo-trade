@@ -367,3 +367,99 @@ class UpstoxClient:
             "order_id": f"SIM-{uuid_lib.uuid4().hex[:8].upper()}",
             "trade_mode": "simulated",
         }
+
+    # ============ ACCOUNT / PORTFOLIO (live only) ============
+
+    async def get_funds_and_margin(self) -> Optional[Dict[str, Any]]:
+        """Fetch available funds and margin from Upstox (equity segment).
+
+        Returns dict with: available_margin, used_margin, payin_amount, etc.
+        Returns None on failure or if not configured.
+        """
+        if not self.live_access_token:
+            return None
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.market_quote_url}/user/get-funds-and-margin",
+                    params={"segment": "SEC"},
+                    headers={
+                        "Authorization": f"Bearer {self.live_access_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        equity = data.get("data", {}).get("equity", data.get("data", {}))
+                        logger.info(
+                            f"Upstox funds: available={equity.get('available_margin')}, "
+                            f"used={equity.get('used_margin')}"
+                        )
+                        return equity
+                else:
+                    logger.warning(f"Upstox funds API returned {resp.status_code}: {resp.text[:300]}")
+        except Exception as e:
+            logger.error(f"Error fetching Upstox funds: {e}")
+        return None
+
+    async def get_holdings(self) -> list:
+        """Fetch long-term (CNC/delivery) holdings from user's DEMAT account.
+
+        Returns list of holding dicts, each with: trading_symbol, quantity,
+        average_price, last_price, pnl, isin, etc.
+        """
+        if not self.live_access_token:
+            return []
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.market_quote_url}/portfolio/long-term-holdings",
+                    headers={
+                        "Authorization": f"Bearer {self.live_access_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        holdings = data.get("data", []) or []
+                        logger.info(f"Upstox holdings: {len(holdings)} instruments")
+                        return holdings
+                else:
+                    logger.warning(f"Upstox holdings API returned {resp.status_code}: {resp.text[:300]}")
+        except Exception as e:
+            logger.error(f"Error fetching Upstox holdings: {e}")
+        return []
+
+    async def get_positions(self) -> list:
+        """Fetch short-term (intraday) positions.
+
+        Returns list of position dicts with: trading_symbol, quantity,
+        buy_price, sell_price, pnl, product, etc.
+        """
+        if not self.live_access_token:
+            return []
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{self.market_quote_url}/portfolio/short-term-positions",
+                    headers={
+                        "Authorization": f"Bearer {self.live_access_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=10.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("status") == "success":
+                        positions = data.get("data", []) or []
+                        logger.info(f"Upstox positions: {len(positions)} open")
+                        return positions
+                else:
+                    logger.warning(f"Upstox positions API returned {resp.status_code}: {resp.text[:300]}")
+        except Exception as e:
+            logger.error(f"Error fetching Upstox positions: {e}")
+        return []

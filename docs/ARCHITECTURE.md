@@ -121,8 +121,12 @@ desi-algo-trade/
 
 - Single `APIRouter` at `/api`; all core endpoints live here.
 - **Mode-scoped**: A `_current_trade_mode()` helper returns `"sandbox"` or `"live"` based on `UpstoxClient.sandbox`. All query endpoints (portfolio, recommendations, trade history, stats) filter by this mode. New recommendations are tagged with the current mode at creation.
-- **Helpers**: `_get_technical_data(symbol)` (candle cache + indicators), `_get_risk_settings()`.
-- **Groups**: Root/health, stocks, market, AI (analyze, scan-all), recommendations (list, approve), portfolio (holdings, refresh, scan-sells, sell), trades (history, stats), settings, dashboard.
+- **Live portfolio sourcing**: In live mode, `GET /portfolio`, `GET /portfolio/sector-breakdown`, and `GET /dashboard/stats` fetch real holdings and positions from Upstox APIs via `_get_upstox_portfolio()` — no local DB reads. In sandbox mode, local MongoDB is used as before.
+- **Funds**: `GET /funds` returns available margin from Upstox in live mode, or virtual capital in sandbox mode.
+- **Pre-trade fund validation**: When approving a trade in live mode, the system checks Upstox available margin and rejects the order if insufficient.
+- **Portfolio-aware analysis**: `POST /ai/analyze` checks Upstox holdings in live mode to determine ENTRY vs EXIT analysis (sandbox uses local DB).
+- **Helpers**: `_get_technical_data(symbol)` (candle cache + live LTP patch + indicators), `_get_risk_settings()`.
+- **Groups**: Root/health, stocks, market, AI (analyze, scan-all), recommendations (list, approve), portfolio (holdings, funds, refresh, scan-sells, sell), trades (history, stats), settings, dashboard.
 - `update_portfolio()` is mode-aware: queries match on both `stock_symbol` and `trade_mode`, allowing the same stock in both sandbox and live portfolios.
 
 ### 3. `agent_orchestrator.py`
@@ -155,7 +159,8 @@ desi-algo-trade/
 
 - **Credentials**: Live token for all market data; sandbox/live token for orders based on `UPSTOX_USE_SANDBOX`.
 - **Instrument resolution**: Downloads NSE instrument master (gzip JSON), builds `trading_symbol` → `instrument_key` (ISIN) map with override support.
-- **Endpoints**: V2 market quotes (single + batch), V3 historical candles (ISIN key), V3 order placement.
+- **Market data**: V2 market quotes (single + batch), V3 historical candles (ISIN key), V3 order placement.
+- **Account/Portfolio**: `get_funds_and_margin()` (equity segment available margin), `get_holdings()` (DEMAT long-term holdings), `get_positions()` (intraday positions). All use the live Upstox token. Used in live mode to source real portfolio data instead of local DB.
 - **Trade mode**: `place_order()` returns `trade_mode` ("live", "sandbox", or "simulated" on failure/no token).
 
 ### 8. `indicators.py`
@@ -242,7 +247,7 @@ desi-algo-trade/
 | Agent | `AgentChat.jsx` | Conversational AI agent — the home page. Rich message blocks (text, stock cards, analysis, trade signals, suggested prompts). Session persistence. |
 | Research | `AIResearch.jsx` | Stock browser with live prices and sector filter. AI analysis panel with confidence, signals, and trade horizon. Scan-all-stocks action. |
 | Trades | `TradeQueue.jsx` | Three pending tabs (BUY/SHORT/SELL) with approve/edit/reject. Rec History tab. Executed trade log tab with stats bar. Mode badge. |
-| Portfolio | `Portfolio.jsx` | Mode-scoped holdings grid with P&L, target/stop-loss, days held. Sector allocation pie chart. AI sell scan. Direct sell. Mode badge. |
+| Portfolio | `Portfolio.jsx` | Holdings grid with P&L, target/stop-loss, days held, available funds card. Live mode reads from Upstox DEMAT; sandbox from local DB. Sector allocation pie chart. AI sell scan. Direct sell. Mode badge. |
 | Sandbox | `Sandbox.jsx` | Virtual paper trading — account overview, holdings, completed trades, strategy insights, scheduler controls. |
 | Settings | `Settings.jsx` | Risk parameters, Gemini model selector, Upstox connectivity status with token validation. |
 
@@ -259,14 +264,16 @@ UPSTOX_USE_SANDBOX=false → trade_mode = "live"
 
 - **Creation**: Every new `TradeRecommendation`, `TradeHistory`, and `Portfolio` entry is tagged with the current mode.
 - **Queries**: All read endpoints (GET portfolio, recommendations, trades, stats) filter by `trade_mode`.
+- **Live mode data sourcing**: In live mode, portfolio and holdings data is fetched directly from Upstox APIs (`get_holdings()`, `get_positions()`, `get_funds_and_margin()`) instead of the local MongoDB `portfolio` collection. This ensures the UI always reflects the real DEMAT account. Sandbox mode continues to use local MongoDB.
+- **Pre-trade validation**: In live mode, trade approval checks Upstox available margin before placing orders, rejecting if insufficient funds.
 - **Isolation**: The same stock can exist independently in both sandbox and live portfolios.
-- **UI**: Portfolio and Trades pages show a LIVE/SANDBOX badge indicating which mode's data is displayed.
+- **UI**: Portfolio and Trades pages show a LIVE/SANDBOX badge. Portfolio page includes an Available Funds card sourced from Upstox (live) or virtual capital (sandbox).
 
 ---
 
 ## External Dependencies
 
-- **Upstox**: Market data (live token only); orders (sandbox or live by config). Sandbox only supports order APIs, not market data.
+- **Upstox**: Market data (live token only); orders (sandbox or live by config); portfolio/funds (live token, live mode only). Sandbox only supports order APIs, not market data or portfolio APIs.
 - **Google Gemini**: AI analysis, recommendations, intent classification, conversational responses. Requires `GOOGLE_GEMINI_KEY`.
 - **MongoDB**: All persistent state. Requires `MONGO_URL`.
 

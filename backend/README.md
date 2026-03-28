@@ -64,12 +64,12 @@ Create a `.env` file in the `backend/` directory. Do not commit secrets.
 | File | Role |
 |------|------|
 | `server.py` | FastAPI app entry; startup (stock init, model restore, scheduler auto-start), shutdown, CORS, router mounts. |
-| `routes.py` | Core `/api` endpoints — stocks, AI analysis, recommendations, portfolio, trades, settings, dashboard. All query endpoints are **mode-scoped** (sandbox/live). |
+| `routes.py` | Core `/api` endpoints — stocks, AI analysis, recommendations, portfolio, funds, trades, settings, dashboard. All query endpoints are **mode-scoped** (sandbox/live). In live mode, portfolio/funds data is sourced from Upstox APIs. Pre-trade fund validation in live mode. |
 | `agent_orchestrator.py` | Conversational AI agent brain — intent classification with Gemini, handler dispatch (briefing, discover, analyze, signal, approve, portfolio, question). |
 | `agent_routes.py` | `/api/agent` endpoints — session management, message send/receive. |
 | `prompts.py` | Centralized Gemini prompt templates (system prompt, intent classifier, analysis, trade signal, sell signal, discovery, question). |
 | `ai_engine.py` | Gemini API calls with model fallback on rate limits, response parsing (confidence, trade_horizon, key_signals, JSON payloads). |
-| `trading.py` | `UpstoxClient` — market quotes, batch quotes, historical candles (ISIN resolution), order placement (live/sandbox). |
+| `trading.py` | `UpstoxClient` — market quotes, batch quotes, historical candles (ISIN resolution), order placement (live/sandbox), account funds/margin, DEMAT holdings, intraday positions. |
 | `indicators.py` | 20+ technical indicators from OHLCV: Supertrend, Pivot Points, CPR, Fibonacci, EMA/SMA, RSI, MACD, Bollinger, ATR, OBV, ADX, candlestick patterns, weighted signal scorecard. |
 | `candle_cache.py` | Incremental MongoDB cache for historical candles — fetches ~1 year on first call, then appends new candles daily. |
 | `screener.py` | Fast technical pre-screen: momentum, volume, Supertrend, Bollinger, pivots/Fibonacci scoring to rank stocks before AI analysis. |
@@ -78,7 +78,7 @@ Create a `.env` file in the `backend/` directory. Do not commit secrets.
 | `scheduler.py` | Automated daily pipeline — pre-market screener → AI analysis → sandbox execution → intraday monitoring → square-off at 15:15 IST. |
 | `database.py` | MongoDB client (`AsyncIOMotorClient`) and `db` instance. |
 | `models.py` | Pydantic models: Stock, TradeRecommendation, Portfolio, TradeHistory, Settings, SandboxAccount, SandboxHolding, SandboxTrade, SchedulerConfig, AgentSession, MessageBlock, etc. |
-| `stock_data.py` | Static `STOCK_UNIVERSE` list (59 stocks, 10 sectors). |
+| `stock_data.py` | Static `STOCK_UNIVERSE` list (125 stocks + 11 ETFs, 22 sectors). |
 | `stock_init.py` | `initialize_stocks()` — clear and reload stock universe into DB. |
 
 ---
@@ -92,7 +92,7 @@ Create a `.env` file in the `backend/` directory. Do not commit secrets.
 - **Market**: `GET /market/status`
 - **AI**: `POST /ai/analyze`, `GET /ai/analysis/latest`, `GET /ai/analysis/latest/{symbol}`, `GET /ai/analysis/history`, `POST /ai/generate-recommendation/{symbol}`, `POST /ai/scan-all`
 - **Recommendations**: `GET /recommendations`, `GET /recommendations/pending`, `POST /recommendations/{id}/approve`
-- **Portfolio**: `GET /portfolio`, `GET /portfolio/sector-breakdown`, `POST /portfolio/refresh-prices`, `POST /portfolio/scan-sells`, `POST /portfolio/{symbol}/sell`
+- **Portfolio**: `GET /portfolio`, `GET /portfolio/sector-breakdown`, `GET /funds`, `POST /portfolio/refresh-prices`, `POST /portfolio/scan-sells`, `POST /portfolio/{symbol}/sell`
 - **Trades**: `GET /trades/history`, `GET /trades/stats`
 - **Settings**: `GET /settings`, `POST /settings`, `GET /settings/models`, `POST /settings/model`, `GET /settings/upstox-status`
 - **Dashboard**: `GET /dashboard/stats`
@@ -120,8 +120,8 @@ Create a `.env` file in the `backend/` directory. Do not commit secrets.
 
 All core data endpoints (portfolio, recommendations, trade history, trade stats, dashboard stats) are filtered by the current Upstox mode:
 
-- **Sandbox mode** (`UPSTOX_USE_SANDBOX=true`): Only entries with `trade_mode: "sandbox"` are returned.
-- **Live mode** (`UPSTOX_USE_SANDBOX=false`): Only entries with `trade_mode: "live"` are returned.
+- **Sandbox mode** (`UPSTOX_USE_SANDBOX=true`): Only entries with `trade_mode: "sandbox"` are returned. Portfolio data from local MongoDB.
+- **Live mode** (`UPSTOX_USE_SANDBOX=false`): Only entries with `trade_mode: "live"` are returned. Portfolio, holdings, and funds are fetched directly from Upstox APIs (`get_holdings()`, `get_positions()`, `get_funds_and_margin()`). Pre-trade fund validation checks available margin before placing orders.
 
 New recommendations are tagged with the current mode at creation time. The same stock can exist independently in both sandbox and live portfolios.
 

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from database import db
-from trading import UpstoxClient
+from trading import UpstoxClient, SYMBOL_OVERRIDES
 from ai_engine import (
     get_ai_stock_analysis,
     generate_trade_recommendation,
@@ -334,9 +334,40 @@ async def handle_discover(
 
 
 async def _check_portfolio(symbol: str) -> Optional[Dict[str, Any]]:
-    """Return the portfolio holding for a symbol in the current mode, or None if not held."""
+    """Return the portfolio holding for a symbol in the current mode, or None if not held.
+
+    Live mode  → checks actual Upstox holdings.
+    Sandbox    → checks local MongoDB.
+    """
+    sym = symbol.upper()
+    mode = _current_trade_mode()
+
+    if mode == "live":
+        try:
+            raw_holdings = await upstox_client.get_holdings()
+            await upstox_client._ensure_instrument_map()
+            isin_to_ts = {ik: ts for ts, ik in upstox_client._instrument_map.items()}
+            ts_to_our = {isin_to_ts.get(v, k): k for k, v in SYMBOL_OVERRIDES.items()}
+            for h in raw_holdings:
+                upstox_sym = h.get("trading_symbol") or h.get("tradingsymbol", "")
+                our_sym = ts_to_our.get(upstox_sym, upstox_sym)
+                if our_sym == sym and h.get("quantity", 0) > 0:
+                    return {
+                        "stock_symbol": sym,
+                        "stock_name": h.get("company_name", sym),
+                        "quantity": h["quantity"],
+                        "avg_buy_price": float(h.get("average_price", 0)),
+                        "current_price": float(h.get("last_price", 0)),
+                        "invested_value": float(h.get("average_price", 0)) * h["quantity"],
+                        "current_value": float(h.get("last_price", 0)) * h["quantity"],
+                        "trade_mode": "live",
+                    }
+            return None
+        except Exception as e:
+            logger.warning(f"Could not check Upstox holdings for {sym}: {e}")
+
     return await db.portfolio.find_one(
-        {"stock_symbol": symbol.upper(), "trade_mode": _current_trade_mode()}, {"_id": 0}
+        {"stock_symbol": sym, "trade_mode": mode}, {"_id": 0}
     )
 
 
@@ -657,44 +688,74 @@ async def handle_portfolio(session_ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
     blocks: List[Dict[str, Any]] = []
     mode = _current_trade_mode()
 
-    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
+    if mode == "live":
+        # Fetch real portfolio from Upstox
+        from routes import _get_upstox_portfolio
+        try:
+            portfolio_data = await _get_upstox_portfolio()
+            raw_holdings = portfolio_data.get("holdings", [])
+        except Exception as e:
+            logger.error(f"Failed to fetch Upstox portfolio: {e}")
+            raw_holdings = []
+        holdings = raw_holdings
+    else:
+        holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
+
     if not holdings:
         blocks.append(_text(f"Your **{mode}** portfolio is empty. Let's find some stocks to buy!"))
         blocks.append(_prompts(["Morning briefing", "Find stocks to buy"]))
         return blocks
 
-    # Refresh prices
-    symbols = [h["stock_symbol"] for h in holdings]
-    quotes = await upstox_client.get_batch_quotes(symbols)
     total_invested = 0
     total_current = 0
     holding_cards = []
 
-    for h in holdings:
-        sym = h["stock_symbol"]
-        price_data = quotes.get(sym, {})
-        ltp = float(price_data.get("ltp", 0)) if price_data else h.get("current_price", 0)
-        qty = h["quantity"]
-        invested = h.get("invested_value", 0)
-        current_val = qty * ltp if ltp else h.get("current_value", 0)
-        pnl = current_val - invested
-        pnl_pct = (pnl / invested * 100) if invested > 0 else 0
-
-        total_invested += invested
-        total_current += current_val
-
-        holding_cards.append({
-            "symbol": sym,
-            "name": h.get("stock_name", sym),
-            "quantity": qty,
-            "avg_buy_price": h.get("avg_buy_price", 0),
-            "current_price": ltp,
-            "pnl": round(pnl, 2),
-            "pnl_percent": round(pnl_pct, 2),
-            "trade_horizon": h.get("trade_horizon", ""),
-            "target_price": h.get("target_price"),
-            "stop_loss": h.get("stop_loss"),
-        })
+    if mode == "live":
+        for h in holdings:
+            invested = h.get("invested_value", 0)
+            current_val = h.get("current_value", 0)
+            pnl = h.get("pnl", current_val - invested)
+            pnl_pct = h.get("pnl_percent", (pnl / invested * 100) if invested > 0 else 0)
+            total_invested += invested
+            total_current += current_val
+            holding_cards.append({
+                "symbol": h.get("stock_symbol", ""),
+                "name": h.get("stock_name", h.get("stock_symbol", "")),
+                "quantity": h.get("quantity", 0),
+                "avg_buy_price": h.get("avg_buy_price", 0),
+                "current_price": h.get("current_price", 0),
+                "pnl": round(pnl, 2),
+                "pnl_percent": round(pnl_pct, 2),
+                "trade_horizon": h.get("product_type", ""),
+                "target_price": None,
+                "stop_loss": None,
+            })
+    else:
+        symbols = [h["stock_symbol"] for h in holdings]
+        quotes = await upstox_client.get_batch_quotes(symbols)
+        for h in holdings:
+            sym = h["stock_symbol"]
+            price_data = quotes.get(sym, {})
+            ltp = float(price_data.get("ltp", 0)) if price_data else h.get("current_price", 0)
+            qty = h["quantity"]
+            invested = h.get("invested_value", 0)
+            current_val = qty * ltp if ltp else h.get("current_value", 0)
+            pnl = current_val - invested
+            pnl_pct = (pnl / invested * 100) if invested > 0 else 0
+            total_invested += invested
+            total_current += current_val
+            holding_cards.append({
+                "symbol": sym,
+                "name": h.get("stock_name", sym),
+                "quantity": qty,
+                "avg_buy_price": h.get("avg_buy_price", 0),
+                "current_price": ltp,
+                "pnl": round(pnl, 2),
+                "pnl_percent": round(pnl_pct, 2),
+                "trade_horizon": h.get("trade_horizon", ""),
+                "target_price": h.get("target_price"),
+                "stop_loss": h.get("stop_loss"),
+            })
 
     total_pnl = total_current - total_invested
     total_pnl_pct = (total_pnl / total_invested * 100) if total_invested > 0 else 0
@@ -735,18 +796,29 @@ async def handle_portfolio_sell_scan(session_ctx: Dict[str, Any]) -> List[Dict[s
     blocks: List[Dict[str, Any]] = []
     mode = _current_trade_mode()
 
-    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
+    if mode == "live":
+        from routes import _get_upstox_portfolio
+        try:
+            portfolio_data = await _get_upstox_portfolio()
+            holdings = portfolio_data.get("holdings", [])
+        except Exception as e:
+            logger.error(f"Failed to fetch Upstox portfolio for sell scan: {e}")
+            holdings = []
+    else:
+        holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
+
     if not holdings:
         blocks.append(_text(f"**{mode.title()}** portfolio is empty — nothing to scan."))
         return blocks
 
-    symbols = [h["stock_symbol"] for h in holdings]
-    quotes = await upstox_client.get_batch_quotes(symbols)
-    for h in holdings:
-        sym = h["stock_symbol"]
-        if sym in quotes and quotes[sym].get("ltp"):
-            h["current_price"] = float(quotes[sym]["ltp"])
-            h["current_value"] = h["quantity"] * h["current_price"]
+    if mode != "live":
+        symbols = [h["stock_symbol"] for h in holdings]
+        quotes = await upstox_client.get_batch_quotes(symbols)
+        for h in holdings:
+            sym = h["stock_symbol"]
+            if sym in quotes and quotes[sym].get("ltp"):
+                h["current_price"] = float(quotes[sym]["ltp"])
+                h["current_value"] = h["quantity"] * h["current_price"]
 
     blocks.append(_text(f"Scanning **{len(holdings)}** holdings for sell signals..."))
 

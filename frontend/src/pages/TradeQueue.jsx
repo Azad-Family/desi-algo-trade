@@ -67,9 +67,9 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
           <ActionIcon action={rec.action} />
           {rec.action}
         </Badge>
-        {rec.product_type === "INTRADAY" && (
+        {/* {rec.product_type === "INTRADAY" && (
           <Badge className="text-[9px] bg-orange-500/20 text-orange-300 border-orange-500/30">INTRADAY</Badge>
-        )}
+        )} */}
       </div>
     </td>
     <td className="p-4 font-mono">{rec.quantity}</td>

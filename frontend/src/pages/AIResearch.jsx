@@ -560,12 +560,16 @@ export default function AIResearch() {
   const scanAllStocks = async () => {
     setScanningAll(true);
     try {
-      const res = await axios.post(`${API}/ai/scan-all`);
-      toast.success(`Scan complete: ${res.data.generated} new recommendations`);
+      const res = await axios.post(`${API}/ai/scan-all`, null, { timeout: 600000 });
+      const d = res.data;
+      toast.success(
+        `Scan complete: ${d.screened} screened → ${d.analyzed} analyzed → ${d.generated} signals`
+      );
+      fetchHistory();
       navigate("/trades");
     } catch (error) {
       console.error("Scan failed:", error);
-      toast.error("Failed to run scan");
+      toast.error("Scan failed — check backend logs");
     } finally {
       setScanningAll(false);
     }

@@ -16,7 +16,7 @@ from ai_engine import (
     get_ai_stock_analysis, generate_trade_recommendation, generate_portfolio_sell_signal,
     get_active_model, get_available_models, get_preferred_model, set_preferred_model,
 )
-from trading import UpstoxClient
+from trading import UpstoxClient, SYMBOL_OVERRIDES
 from indicators import compute_indicators, format_indicators_for_prompt, format_technical_numbers_for_ai
 from stock_init import initialize_stocks
 from database import db
@@ -35,8 +35,9 @@ def _current_trade_mode() -> str:
 
 
 async def _get_technical_data(symbol: str) -> tuple:
-    """Get candles from cache (or Upstox if stale/missing), then compute indicators.
-    
+    """Get candles from cache (or Upstox if stale/missing), compute indicators,
+    and patch in the live market price so the AI sees real-time LTP.
+
     Returns (formatted_string, raw_indicators_dict).
     On failure returns ("", None).
     """
@@ -45,6 +46,27 @@ async def _get_technical_data(symbol: str) -> tuple:
         if candles:
             indicators = compute_indicators(candles)
             if indicators:
+                # Patch live price: candle "current_price" is yesterday's close;
+                # fetch real-time LTP so the AI uses the actual market price.
+                try:
+                    quotes = await upstox_client.get_batch_quotes([symbol])
+                    live = quotes.get(symbol)
+                    if live and live.get("ltp") and float(live["ltp"]) > 0:
+                        ltp = round(float(live["ltp"]), 2)
+                        candle_close = indicators["current_price"]
+                        indicators["current_price"] = ltp
+                        indicators["live_ltp"] = ltp
+                        indicators["prev_day_close"] = candle_close
+                        indicators["live_change_pct"] = round(
+                            (ltp - candle_close) / candle_close * 100, 2
+                        ) if candle_close else 0
+                        logger.debug(
+                            f"{symbol}: patched price {candle_close} → {ltp} "
+                            f"({indicators['live_change_pct']:+.2f}%)"
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not fetch live price for {symbol}: {e}")
+
                 full_block = format_indicators_for_prompt(indicators)
                 numbers_block = format_technical_numbers_for_ai(indicators)
                 technical_data = f"{numbers_block}\n\n{full_block}" if numbers_block else full_block
@@ -323,7 +345,36 @@ async def analyze_stock(request: AIAnalysisRequest):
         raise HTTPException(status_code=404, detail="Stock not found")
 
     trade_mode = _current_trade_mode()
-    holding = await db.portfolio.find_one({"stock_symbol": symbol, "trade_mode": trade_mode}, {"_id": 0})
+
+    # Check if user holds this stock — Upstox in live mode, local DB in sandbox
+    holding = None
+    if trade_mode == "live":
+        try:
+            raw_holdings = await upstox_client.get_holdings()
+            await upstox_client._ensure_instrument_map()
+            isin_to_ts = {ik: ts for ts, ik in upstox_client._instrument_map.items()}
+            ts_to_our = {isin_to_ts.get(v, k): k for k, v in SYMBOL_OVERRIDES.items()}
+            for h in raw_holdings:
+                upstox_sym = h.get("trading_symbol") or h.get("tradingsymbol", "")
+                our_sym = ts_to_our.get(upstox_sym, upstox_sym)
+                if our_sym == symbol and h.get("quantity", 0) > 0:
+                    holding = {
+                        "stock_symbol": symbol,
+                        "stock_name": h.get("company_name", symbol),
+                        "quantity": h["quantity"],
+                        "avg_buy_price": float(h.get("average_price", 0)),
+                        "current_price": float(h.get("last_price", 0)),
+                        "invested_value": float(h.get("average_price", 0)) * h["quantity"],
+                        "current_value": float(h.get("last_price", 0)) * h["quantity"],
+                        "trade_mode": "live",
+                    }
+                    break
+        except Exception as e:
+            logger.warning(f"Could not check Upstox holdings for {symbol}: {e}")
+            holding = await db.portfolio.find_one({"stock_symbol": symbol, "trade_mode": trade_mode}, {"_id": 0})
+    else:
+        holding = await db.portfolio.find_one({"stock_symbol": symbol, "trade_mode": trade_mode}, {"_id": 0})
+
     mode = "exit" if holding else "entry"
 
     try:
@@ -519,56 +570,87 @@ async def generate_recommendation(symbol: str):
         raise HTTPException(status_code=500, detail=f"Failed to generate recommendation: {str(e)}")
 
 
-# How many stocks to scan per "Scan All" run (to limit API/time). Picked by symbol order for determinism.
+SCAN_ALL_MAX_CANDIDATES = 15
+
+
 @api_router.post("/ai/scan-all")
 async def scan_all_stocks():
-    """Run AI scan on ALL stocks in the universe.
+    """Scan the full stock universe using a two-phase approach:
 
-    Deletes all previous pending recommendations (BUY, SHORT, and SELL),
-    then scans every stock and generates fresh trade signals.
+    Phase 1 — Fast screener: score ALL stocks using technical indicators
+              (parallel, no AI calls — takes ~30s for 125 stocks).
+    Phase 2 — Deep AI analysis: run Gemini on the top N candidates only
+              (sequential with 2s sleep — takes ~5 min for 15 stocks).
+
+    Deletes all previous pending recommendations for the current mode,
+    then generates fresh trade signals for the top candidates.
     """
+    from screener import screen_all_stocks as run_screener
+
     mode = _current_trade_mode()
 
-    # Clear pending recommendations for the current mode before fresh scan
     delete_result = await db.trade_recommendations.delete_many({"status": "pending", "trade_mode": mode})
     deleted_count = delete_result.deleted_count
-    logger.info(f"Scan All [{mode}]: deleted {deleted_count} pending recommendations before fresh scan")
+    logger.info(f"Scan All [{mode}]: deleted {deleted_count} pending recommendations")
 
-    stocks = await db.stocks.find({}, {"_id": 0}).to_list(500)
-    stocks_sorted = sorted(stocks, key=lambda s: (s.get("sector", ""), s.get("symbol", "")))
+    # Phase 1: fast technical screening of all stocks
+    logger.info("=== SCAN ALL: Phase 1 — Screener ===")
+    screener_result = await run_screener()
+    buy_candidates = screener_result.get("buy_candidates", [])
+    short_candidates = screener_result.get("short_candidates", [])
+    total_screened = screener_result.get("total_screened", 0)
+    logger.info(
+        f"Screener done: {total_screened} screened, "
+        f"{len(buy_candidates)} buy + {len(short_candidates)} short candidates"
+    )
+
+    # Phase 2: deep AI analysis on top candidates only
+    logger.info("=== SCAN ALL: Phase 2 — Deep AI analysis ===")
+    top_buys = buy_candidates[:SCAN_ALL_MAX_CANDIDATES]
+    top_shorts = short_candidates[:5]
+
+    stocks_map = {
+        s["symbol"]: s
+        for s in await db.stocks.find({}, {"_id": 0}).to_list(500)
+    }
 
     max_val, risk_pct = await _get_risk_settings()
     generated = 0
-    scanned = 0
-
+    analyzed = 0
     scan_time = datetime.now(timezone.utc).isoformat()
 
-    for stock in stocks_sorted:
-        scanned += 1
+    for candidate in top_buys + top_shorts:
+        sym = candidate["symbol"]
+        stock = stocks_map.get(sym)
+        if not stock:
+            continue
+
+        analyzed += 1
         try:
-            technical_data, indicators_raw = await _get_technical_data(stock["symbol"])
+            technical_data, indicators_raw = await _get_technical_data(sym)
 
             recommendation = await generate_trade_recommendation(
-                stock["symbol"],
+                sym,
                 stock["name"],
-                stock["sector"],
+                stock.get("sector", ""),
                 technical_data=technical_data,
                 indicators_raw=indicators_raw,
                 max_trade_value=max_val,
                 risk_per_trade_pct=risk_pct,
             )
 
-            # Persist analysis record so it shows in AI Research history
             action = recommendation["action"] if recommendation else "HOLD"
             analysis_doc = {
                 "id": str(uuid_lib.uuid4()),
-                "stock_symbol": stock["symbol"],
+                "stock_symbol": sym,
                 "analysis": recommendation.get("ai_reasoning", "No actionable signal") if recommendation else "No actionable signal",
                 "confidence_score": recommendation.get("confidence_score", 0) if recommendation else 0,
                 "analysis_type": "hybrid",
                 "trade_horizon": recommendation.get("trade_horizon") if recommendation else None,
                 "key_signals": {
                     "action": action,
+                    "screener_score": candidate.get("score"),
+                    "screener_bias": candidate.get("bias"),
                     **(recommendation.get("key_signals", {}) if recommendation else {}),
                 },
                 "mode": "entry",
@@ -597,18 +679,22 @@ async def scan_all_stocks():
                 )
                 await db.trade_recommendations.insert_one(trade_rec.model_dump())
                 generated += 1
+
             await asyncio.sleep(2)
         except Exception as e:
-            logger.error(f"Error scanning {stock['symbol']}: {e}")
+            logger.error(f"Error scanning {sym}: {e}")
 
     scanned_at = datetime.now(timezone.utc).isoformat()
-    logger.info(f"Scan All completed at {scanned_at}: {generated} signals from {scanned} stocks")
+    logger.info(f"Scan All completed at {scanned_at}: {generated} signals from {analyzed} deep-analyzed ({total_screened} screened)")
 
     return {
-        "message": f"Scan complete: {generated} new signals from {scanned} stocks. {deleted_count} old pending recommendations cleared.",
+        "message": f"Scan complete: {total_screened} screened, {analyzed} deep-analyzed, {generated} new signals. {deleted_count} old pending cleared.",
         "generated": generated,
-        "scanned": scanned,
+        "screened": total_screened,
+        "analyzed": analyzed,
         "deleted": deleted_count,
+        "buy_candidates": len(buy_candidates),
+        "short_candidates": len(short_candidates),
         "scanned_at": scanned_at,
     }
 
@@ -669,6 +755,21 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
         if approval.approved:
             quantity = approval.modified_quantity or rec["quantity"]
             price = approval.modified_price or rec["target_price"]
+
+            # Pre-trade fund check in live mode
+            mode = _current_trade_mode()
+            if mode == "live" and rec["action"] in ("BUY", "SHORT"):
+                trade_value = quantity * price
+                funds = await upstox_client.get_funds_and_margin()
+                if funds:
+                    available = float(funds.get("available_margin", 0))
+                    if available < trade_value:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Insufficient funds: need Rs.{trade_value:,.2f} but only Rs.{available:,.2f} available"
+                        )
+                else:
+                    logger.warning("Could not verify funds — proceeding with order anyway")
 
             # SHORT trades: send as SELL with product=I (Intraday) to Upstox
             upstox_action = rec["action"]
@@ -737,13 +838,115 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
 
 
 # ============ PORTFOLIO ROUTES ============
+
+async def _get_upstox_portfolio() -> dict:
+    """Fetch live portfolio from Upstox (holdings + positions) and normalize."""
+    raw_holdings = await upstox_client.get_holdings()
+    raw_positions = await upstox_client.get_positions()
+
+    # Build symbol → sector lookup from our stocks DB
+    all_stocks = await db.stocks.find({}, {"_id": 0, "symbol": 1, "sector": 1}).to_list(500)
+    sector_map = {s["symbol"]: s.get("sector", "Unknown") for s in all_stocks}
+
+    # Also build reverse map: Upstox trading_symbol → our symbol
+    await upstox_client._ensure_instrument_map()
+    isin_to_ts = {ik: ts for ts, ik in upstox_client._instrument_map.items()}
+    ts_to_our = {}
+    for our_sym, isin_key in SYMBOL_OVERRIDES.items():
+        actual_ts = isin_to_ts.get(isin_key, our_sym)
+        ts_to_our[actual_ts] = our_sym
+    for ts in upstox_client._instrument_map:
+        if ts not in ts_to_our:
+            ts_to_our[ts] = ts
+
+    holdings = []
+    for h in raw_holdings:
+        qty = h.get("quantity", 0)
+        if qty <= 0:
+            continue
+        upstox_sym = h.get("trading_symbol") or h.get("tradingsymbol", "")
+        our_sym = ts_to_our.get(upstox_sym, upstox_sym)
+        avg = float(h.get("average_price", 0))
+        ltp = float(h.get("last_price", 0))
+        invested = avg * qty
+        current = ltp * qty
+        holdings.append({
+            "stock_symbol": our_sym,
+            "stock_name": h.get("company_name", our_sym),
+            "quantity": qty,
+            "avg_buy_price": round(avg, 2),
+            "current_price": round(ltp, 2),
+            "invested_value": round(invested, 2),
+            "current_value": round(current, 2),
+            "pnl": round(float(h.get("pnl", current - invested)), 2),
+            "pnl_percent": round((current - invested) / invested * 100, 2) if invested > 0 else 0,
+            "day_change": h.get("day_change", 0),
+            "day_change_percentage": h.get("day_change_percentage", 0),
+            "sector": sector_map.get(our_sym, "Unknown"),
+            "product_type": "CNC",
+            "trade_mode": "live",
+            "source": "upstox",
+        })
+
+    for p in raw_positions:
+        qty = p.get("quantity", 0) or p.get("net_quantity", 0)
+        if qty == 0:
+            continue
+        upstox_sym = p.get("trading_symbol") or p.get("tradingsymbol", "")
+        our_sym = ts_to_our.get(upstox_sym, upstox_sym)
+        buy_price = float(p.get("buy_price", 0) or p.get("average_price", 0))
+        ltp = float(p.get("last_price", 0))
+        invested = buy_price * abs(qty)
+        current = ltp * abs(qty)
+        holdings.append({
+            "stock_symbol": our_sym,
+            "stock_name": our_sym,
+            "quantity": qty,
+            "avg_buy_price": round(buy_price, 2),
+            "current_price": round(ltp, 2),
+            "invested_value": round(invested, 2),
+            "current_value": round(current, 2),
+            "pnl": round(float(p.get("pnl", current - invested)), 2),
+            "pnl_percent": round((current - invested) / invested * 100, 2) if invested > 0 else 0,
+            "sector": sector_map.get(our_sym, "Unknown"),
+            "product_type": "INTRADAY" if p.get("product") == "I" else "CNC",
+            "trade_mode": "live",
+            "source": "upstox",
+        })
+
+    total_invested = sum(h["invested_value"] for h in holdings)
+    total_current = sum(h["current_value"] for h in holdings)
+    total_pnl = total_current - total_invested
+    return {
+        "holdings": holdings,
+        "summary": {
+            "total_invested": round(total_invested, 2),
+            "total_current": round(total_current, 2),
+            "total_pnl": round(total_pnl, 2),
+            "total_pnl_percent": round((total_pnl / total_invested * 100) if total_invested > 0 else 0, 2),
+            "holdings_count": len(holdings),
+        },
+        "trade_mode": "live",
+    }
+
+
 @api_router.get("/portfolio")
 async def get_portfolio():
-    """Get portfolio holdings for the current mode (sandbox/live)."""
-    mode = _current_trade_mode()
-    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
+    """Get portfolio holdings.
 
-    # Backfill missing sectors from stocks collection
+    Live mode  → fetches actual holdings + positions from Upstox.
+    Sandbox    → reads from local MongoDB portfolio collection.
+    """
+    mode = _current_trade_mode()
+
+    if mode == "live":
+        try:
+            return await _get_upstox_portfolio()
+        except Exception as e:
+            logger.error(f"Failed to fetch Upstox portfolio, falling back to local DB: {e}")
+
+    # Sandbox mode (or live fallback)
+    holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
     for h in holdings:
         if not h.get("sector"):
             stock_doc = await db.stocks.find_one({"symbol": h["stock_symbol"]}, {"sector": 1})
@@ -753,13 +956,12 @@ async def get_portfolio():
                     {"stock_symbol": h["stock_symbol"], "trade_mode": mode},
                     {"$set": {"sector": stock_doc["sector"]}},
                 )
-    
-    # Calculate totals
+
     total_invested = sum(h.get("invested_value", 0) for h in holdings)
     total_current = sum(h.get("current_value", 0) for h in holdings)
     total_pnl = total_current - total_invested
     total_pnl_percent = (total_pnl / total_invested * 100) if total_invested > 0 else 0
-    
+
     return {
         "holdings": holdings,
         "summary": {
@@ -777,6 +979,26 @@ async def get_portfolio():
 async def get_portfolio_sector_breakdown():
     """Get portfolio breakdown by sector for current mode."""
     mode = _current_trade_mode()
+
+    if mode == "live":
+        try:
+            data = await _get_upstox_portfolio()
+            sector_agg = {}
+            for h in data["holdings"]:
+                sec = h.get("sector", "Unknown")
+                if sec not in sector_agg:
+                    sector_agg[sec] = {"value": 0, "count": 0}
+                sector_agg[sec]["value"] += h["current_value"]
+                sector_agg[sec]["count"] += 1
+            breakdown = [
+                {"sector": s, "value": round(v["value"], 2), "count": v["count"]}
+                for s, v in sector_agg.items()
+            ]
+            breakdown.sort(key=lambda x: x["value"], reverse=True)
+            return breakdown
+        except Exception as e:
+            logger.error(f"Upstox sector breakdown failed: {e}")
+
     pipeline = [
         {"$match": {"trade_mode": mode}},
         {"$group": {
@@ -790,13 +1012,50 @@ async def get_portfolio_sector_breakdown():
     return [{"sector": b["_id"], "value": b["total_value"], "count": b["count"]} for b in breakdown]
 
 
+@api_router.get("/funds")
+async def get_funds():
+    """Get available funds/margin.
+
+    Live mode  → real Upstox balance.
+    Sandbox    → virtual capital from sandbox account.
+    """
+    mode = _current_trade_mode()
+    if mode == "live":
+        funds = await upstox_client.get_funds_and_margin()
+        if funds:
+            return {
+                "available_margin": funds.get("available_margin", 0),
+                "used_margin": funds.get("used_margin", 0),
+                "payin_amount": funds.get("payin_amount", 0),
+                "trade_mode": "live",
+                "source": "upstox",
+            }
+        return {"available_margin": 0, "used_margin": 0, "trade_mode": "live", "error": "Could not fetch funds from Upstox"}
+
+    # Sandbox
+    from sandbox import get_or_create_account
+    account = await get_or_create_account()
+    return {
+        "available_margin": account.get("current_capital", 0),
+        "used_margin": account.get("initial_capital", 100000) - account.get("current_capital", 0),
+        "payin_amount": account.get("initial_capital", 100000),
+        "trade_mode": "sandbox",
+        "source": "sandbox",
+    }
+
+
 @api_router.post("/portfolio/refresh-prices")
 async def refresh_portfolio_prices():
     """Update current prices for portfolio holdings in the current mode.
-    
-    Should be called after /stocks/refresh so the stocks collection has fresh prices.
+
+    In live mode this is a no-op — prices come directly from Upstox.
+    In sandbox mode, refreshes local DB from market quotes.
     """
     mode = _current_trade_mode()
+
+    if mode == "live":
+        return {"message": "Live portfolio prices come directly from Upstox", "updated": 0}
+
     holdings = await db.portfolio.find({"trade_mode": mode}, {"_id": 0}).to_list(100)
     if not holdings:
         return {"message": "Portfolio is empty", "updated": 0}
@@ -1152,26 +1411,51 @@ async def get_dashboard_stats():
     mode = _current_trade_mode()
     mode_filter = {"trade_mode": mode}
 
-    portfolio = await db.portfolio.find(mode_filter, {"_id": 0}).to_list(100)
-    total_invested = sum(h.get("invested_value", 0) for h in portfolio)
-    total_current = sum(h.get("current_value", 0) for h in portfolio)
-    
+    # Portfolio values — Upstox in live mode, local DB in sandbox
+    if mode == "live":
+        try:
+            portfolio_data = await _get_upstox_portfolio()
+            summary = portfolio_data["summary"]
+            total_invested = summary["total_invested"]
+            total_current = summary["total_current"]
+            holdings_count = summary["holdings_count"]
+        except Exception:
+            total_invested = total_current = 0
+            holdings_count = 0
+    else:
+        portfolio = await db.portfolio.find(mode_filter, {"_id": 0}).to_list(100)
+        total_invested = sum(h.get("invested_value", 0) for h in portfolio)
+        total_current = sum(h.get("current_value", 0) for h in portfolio)
+        holdings_count = len(portfolio)
+
+    # Funds — live from Upstox, sandbox from sandbox account
+    available_margin = 0
+    if mode == "live":
+        funds = await upstox_client.get_funds_and_margin()
+        if funds:
+            available_margin = float(funds.get("available_margin", 0))
+    else:
+        from sandbox import get_or_create_account
+        account = await get_or_create_account()
+        available_margin = account.get("current_capital", 0)
+
     pending_count = await db.trade_recommendations.count_documents({"status": "pending", **mode_filter})
-    
+
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     today_trades = await db.trade_history.count_documents({"executed_at": {"$gte": today_start}, **mode_filter})
-    
+
     stock_count = await db.stocks.count_documents({})
-    
+
     return {
         "portfolio_value": round(total_current, 2),
         "total_invested": round(total_invested, 2),
         "total_pnl": round(total_current - total_invested, 2),
         "pnl_percent": round((total_current - total_invested) / total_invested * 100, 2) if total_invested > 0 else 0,
+        "available_margin": round(available_margin, 2),
         "pending_recommendations": pending_count,
         "today_trades": today_trades,
         "total_stocks": stock_count,
-        "holdings_count": len(portfolio),
+        "holdings_count": holdings_count,
         "trade_mode": mode,
     }
 
