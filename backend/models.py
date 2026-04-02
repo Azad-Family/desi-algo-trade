@@ -125,6 +125,9 @@ class Portfolio(BaseModel):
     pnl: float = 0.0
     pnl_percent: float = 0.0
     sector: str
+    action: str = "BUY"
+    product_type: str = "DELIVERY"
+    is_short: bool = False
     trade_mode: str = "simulated"
     trade_horizon: Optional[str] = None
     target_price: Optional[float] = None
@@ -143,6 +146,7 @@ class TradeHistory(BaseModel):
     quantity: int
     price: float
     total_value: float
+    pnl: Optional[float] = None
     status: str
     trade_mode: str = "simulated"
     executed_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())

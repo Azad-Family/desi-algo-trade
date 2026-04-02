@@ -167,12 +167,13 @@ const RecommendationRow = ({ rec, onApprove, onReject, onEdit }) => (
   </motion.tr>
 );
 
-const TABS = { PENDING_BUY: "pending_buy", PENDING_SHORT: "pending_short", PENDING_SELL: "pending_sell", HISTORY: "history", TRADE_LOG: "trade_log" };
+const TABS = { PENDING_BUY: "pending_buy", PENDING_SHORT: "pending_short", PENDING_SELL: "pending_sell", PAIR_TRADES: "pair_trades", HISTORY: "history", TRADE_LOG: "trade_log" };
 
 export default function TradeQueue() {
   const [recommendations, setRecommendations] = useState([]);
   const [trades, setTrades] = useState([]);
   const [tradeStats, setTradeStats] = useState({});
+  const [pairTrades, setPairTrades] = useState([]);
   const [tab, setTab] = useState(TABS.PENDING_BUY);
   const [loading, setLoading] = useState(true);
   const [editDialog, setEditDialog] = useState({ open: false, rec: null });
@@ -202,9 +203,18 @@ export default function TradeQueue() {
     }
   };
 
+  const fetchPairTrades = async () => {
+    try {
+      const res = await axios.get(`${API}/pairs/trades`);
+      setPairTrades(res.data || []);
+    } catch {
+      /* pairs may not be computed yet */
+    }
+  };
+
   const fetchAll = async () => {
     setLoading(true);
-    await Promise.all([fetchRecommendations(), fetchTradeHistory()]);
+    await Promise.all([fetchRecommendations(), fetchTradeHistory(), fetchPairTrades()]);
     setLoading(false);
   };
 
@@ -377,6 +387,16 @@ export default function TradeQueue() {
           Pending SELL ({pendingSell.length})
         </Button>
         <Button
+          variant={tab === TABS.PAIR_TRADES ? "default" : "outline"}
+          size="sm"
+          onClick={() => setTab(TABS.PAIR_TRADES)}
+          className={tab === TABS.PAIR_TRADES ? "bg-purple-500 hover:bg-purple-500/90" : ""}
+          data-testid="tab-pair-trades"
+        >
+          <ListChecks className="w-4 h-4 mr-1" />
+          Pairs ({pairTrades.length})
+        </Button>
+        <Button
           variant={tab === TABS.HISTORY ? "default" : "outline"}
           size="sm"
           onClick={() => setTab(TABS.HISTORY)}
@@ -395,6 +415,65 @@ export default function TradeQueue() {
           Executed ({trades.length})
         </Button>
       </div>
+
+      {/* Pair Trades Tab */}
+      {tab === TABS.PAIR_TRADES ? (
+        <Card className="bg-surface-primary border-border-subtle">
+          <CardContent className="p-6">
+            {pairTrades.length === 0 ? (
+              <div className="text-center py-16">
+                <ListChecks className="w-12 h-12 text-muted-foreground mx-auto mb-4" />
+                <p className="text-muted-foreground">No active pair trades</p>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Pair trades are generated from correlation analysis when two stocks diverge significantly
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {pairTrades.map((pt, idx) => (
+                  <div key={pt.trade_id || idx} className="p-4 rounded-lg bg-surface-secondary border border-purple-500/20">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <Badge className="bg-signal-success/20 text-signal-success border-signal-success/30 text-xs">
+                          BUY {pt.long_leg}
+                        </Badge>
+                        <span className="text-muted-foreground text-xs">+</span>
+                        <Badge className="bg-orange-500/20 text-orange-300 border-orange-500/30 text-xs">
+                          SHORT {pt.short_leg}
+                        </Badge>
+                      </div>
+                      <Badge className={pt.status === "open" ? "bg-blue-500/20 text-blue-300 border-blue-500/30" : "bg-zinc-500/20 text-zinc-400 border-zinc-500/30"}>
+                        {pt.status}
+                      </Badge>
+                    </div>
+                    <div className="grid grid-cols-4 gap-4 text-xs text-muted-foreground">
+                      <div>
+                        <span className="block text-[10px] uppercase">Correlation</span>
+                        <span className="text-foreground font-medium">{pt.correlation?.toFixed(2)}</span>
+                      </div>
+                      <div>
+                        <span className="block text-[10px] uppercase">Z-Score</span>
+                        <span className="text-foreground font-medium">{pt.z_score?.toFixed(2)}</span>
+                      </div>
+                      <div>
+                        <span className="block text-[10px] uppercase">Long @ Rs.</span>
+                        <span className="text-foreground font-medium">{pt.long_price?.toFixed(2)}</span>
+                      </div>
+                      <div>
+                        <span className="block text-[10px] uppercase">Short @ Rs.</span>
+                        <span className="text-foreground font-medium">{pt.short_price?.toFixed(2)}</span>
+                      </div>
+                    </div>
+                    {pt.reasoning && (
+                      <p className="text-xs text-muted-foreground mt-2 italic">{pt.reasoning}</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      ) : null}
 
       {/* Trade Log Tab */}
       {tab === TABS.TRADE_LOG ? (

@@ -32,7 +32,16 @@ export default function Settings() {
     max_trade_value: 100000,
     max_position_size: 100,
     risk_per_trade_percent: 2,
-    auto_analysis_enabled: true
+    auto_analysis_enabled: true,
+    min_confidence_to_trade: 70,
+    min_confidence_for_live: 80,
+    max_correlated_positions: 3,
+    earnings_blackout_days: 3,
+    daily_loss_limit_pct: 2,
+    pairs_min_correlation: 0.75,
+    pairs_zscore_entry: 2.0,
+    pairs_zscore_exit: 0.5,
+    pairs_max_holding_days: 10,
   });
   const [upstoxStatus, setUpstoxStatus] = useState(null);
   const [modelInfo, setModelInfo] = useState({ available: [], preferred: null, active: "" });
@@ -355,6 +364,140 @@ export default function Settings() {
               onCheckedChange={(checked) => handleChange('auto_analysis_enabled', checked)}
               data-testid="auto-analysis-switch"
             />
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Confidence & Validation */}
+      <Card className="bg-surface-primary border-border-subtle">
+        <CardHeader className="border-b border-border-subtle">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-purple-500/10 rounded-lg">
+              <Shield className="w-5 h-5 text-purple-400" />
+            </div>
+            <div>
+              <CardTitle className="font-heading text-xl">Smart Trading Thresholds</CardTitle>
+              <CardDescription>Confidence gating, correlation limits, and risk controls</CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="p-6 space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <div className="space-y-2">
+              <Label>Min Confidence to Trade</Label>
+              <Input
+                type="number"
+                value={settings.min_confidence_to_trade}
+                onChange={(e) => handleChange('min_confidence_to_trade', parseInt(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Minimum AI confidence score (0-100) to generate any signal</p>
+            </div>
+            <div className="space-y-2">
+              <Label>Min Confidence for Live</Label>
+              <Input
+                type="number"
+                value={settings.min_confidence_for_live}
+                onChange={(e) => handleChange('min_confidence_for_live', parseInt(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Higher bar for live trade signals</p>
+            </div>
+            <div className="space-y-2">
+              <Label>Max Correlated Positions</Label>
+              <Input
+                type="number"
+                value={settings.max_correlated_positions}
+                onChange={(e) => handleChange('max_correlated_positions', parseInt(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Max stocks with &gt;0.7 correlation to hold simultaneously</p>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-2">
+              <Label>Earnings Blackout (days)</Label>
+              <Input
+                type="number"
+                value={settings.earnings_blackout_days}
+                onChange={(e) => handleChange('earnings_blackout_days', parseInt(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Warn if stock reports earnings within N days</p>
+            </div>
+            <div className="space-y-2">
+              <Label>Daily Loss Limit (%)</Label>
+              <Input
+                type="number"
+                step="0.5"
+                value={settings.daily_loss_limit_pct}
+                onChange={(e) => handleChange('daily_loss_limit_pct', parseFloat(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Pause new entries if daily loss exceeds this % of capital</p>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Pairs Trading */}
+      <Card className="bg-surface-primary border-border-subtle">
+        <CardHeader className="border-b border-border-subtle">
+          <div className="flex items-center gap-3">
+            <div className="p-2 bg-cyan-500/10 rounded-lg">
+              <SettingsIcon className="w-5 h-5 text-cyan-400" />
+            </div>
+            <div>
+              <CardTitle className="font-heading text-xl">Pairs Trading</CardTitle>
+              <CardDescription>Configure correlation-based pair trade parameters</CardDescription>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="p-6 space-y-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            <div className="space-y-2">
+              <Label>Min Correlation</Label>
+              <Input
+                type="number"
+                step="0.05"
+                value={settings.pairs_min_correlation}
+                onChange={(e) => handleChange('pairs_min_correlation', parseFloat(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Min correlation to form a pair (0.5-1.0)</p>
+            </div>
+            <div className="space-y-2">
+              <Label>Z-Score Entry</Label>
+              <Input
+                type="number"
+                step="0.1"
+                value={settings.pairs_zscore_entry}
+                onChange={(e) => handleChange('pairs_zscore_entry', parseFloat(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Z-score threshold to enter a pair trade</p>
+            </div>
+            <div className="space-y-2">
+              <Label>Z-Score Exit</Label>
+              <Input
+                type="number"
+                step="0.1"
+                value={settings.pairs_zscore_exit}
+                onChange={(e) => handleChange('pairs_zscore_exit', parseFloat(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Z-score to close pair (mean reversion target)</p>
+            </div>
+            <div className="space-y-2">
+              <Label>Max Holding Days</Label>
+              <Input
+                type="number"
+                value={settings.pairs_max_holding_days}
+                onChange={(e) => handleChange('pairs_max_holding_days', parseInt(e.target.value))}
+                className="bg-surface-secondary border-border-subtle font-mono"
+              />
+              <p className="text-xs text-muted-foreground">Close pair if no convergence after N days</p>
+            </div>
           </div>
         </CardContent>
       </Card>

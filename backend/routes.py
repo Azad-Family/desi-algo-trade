@@ -15,12 +15,16 @@ from models import (
 from ai_engine import (
     get_ai_stock_analysis, generate_trade_recommendation, generate_portfolio_sell_signal,
     get_active_model, get_available_models, get_preferred_model, set_preferred_model,
+    deep_research,
 )
 from trading import UpstoxClient, SYMBOL_OVERRIDES
 from indicators import compute_indicators, format_indicators_for_prompt, format_technical_numbers_for_ai
 from stock_init import initialize_stocks
 from database import db
 from candle_cache import get_candles as get_candles_cached
+from market_context import get_market_context, format_market_context, get_sector_rank
+from correlation import get_correlated_peers, get_beta, format_correlation_for_prompt
+from fundamentals import get_fundamentals, format_fundamentals_for_prompt, refresh_fundamentals
 
 logger = logging.getLogger(__name__)
 upstox_client = UpstoxClient()
@@ -34,9 +38,12 @@ def _current_trade_mode() -> str:
     return "sandbox" if upstox_client.sandbox else "live"
 
 
-async def _get_technical_data(symbol: str) -> tuple:
+async def _get_technical_data(symbol: str, include_intraday: bool = True) -> tuple:
     """Get candles from cache (or Upstox if stale/missing), compute indicators,
     and patch in the live market price so the AI sees real-time LTP.
+
+    When include_intraday=True and market is open, also fetches 15-min candles
+    and appends intraday-specific indicators (VWAP, intraday RSI, momentum).
 
     Returns (formatted_string, raw_indicators_dict).
     On failure returns ("", None).
@@ -66,10 +73,31 @@ async def _get_technical_data(symbol: str) -> tuple:
                         )
                 except Exception as e:
                     logger.debug(f"Could not fetch live price for {symbol}: {e}")
+                    indicators["_price_stale"] = True
 
                 full_block = format_indicators_for_prompt(indicators)
+                if indicators.get("_price_stale"):
+                    full_block = ("⚠️ WARNING: Live price unavailable — using last daily candle close. "
+                                  "Price may be stale.\n\n" + full_block)
                 numbers_block = format_technical_numbers_for_ai(indicators)
                 technical_data = f"{numbers_block}\n\n{full_block}" if numbers_block else full_block
+
+                # Append intraday candle analysis during market hours
+                if include_intraday:
+                    try:
+                        from candle_cache import get_intraday_candles
+                        from indicators import compute_intraday_indicators, format_intraday_for_prompt
+                        intraday_candles = await get_intraday_candles(symbol, upstox_client, interval=15)
+                        if intraday_candles and len(intraday_candles) >= 5:
+                            intraday_ind = compute_intraday_indicators(intraday_candles)
+                            if intraday_ind:
+                                intraday_text = format_intraday_for_prompt(intraday_ind)
+                                if intraday_text:
+                                    technical_data += f"\n\n{intraday_text}"
+                                    indicators["_intraday"] = intraday_ind
+                    except Exception as e:
+                        logger.debug(f"Could not fetch intraday data for {symbol}: {e}")
+
                 return technical_data, indicators
     except Exception as e:
         logger.warning(f"Could not get technical data for {symbol}: {e}")
@@ -303,7 +331,10 @@ async def refresh_stock_prices():
                 qty = h["quantity"]
                 invested = h.get("invested_value", 0)
                 current_val = qty * ltp
-                pnl = current_val - invested
+                if h.get("is_short", False):
+                    pnl = invested - current_val
+                else:
+                    pnl = current_val - invested
                 pnl_pct = (pnl / invested * 100) if invested > 0 else 0.0
                 await db.portfolio.update_one(
                     {"stock_symbol": sym, "trade_mode": current_mode},
@@ -380,12 +411,33 @@ async def analyze_stock(request: AIAnalysisRequest):
     try:
         technical_data, indicators_raw = await _get_technical_data(symbol)
 
+        # Fetch market context for macro-aware analysis
+        mkt_ctx = await get_market_context()
+        mkt_ctx_text = format_market_context(mkt_ctx)
+
+        # Fetch correlation context
+        peers = await get_correlated_peers(symbol)
+        beta = await get_beta(symbol)
+        sector_rank_info = get_sector_rank(mkt_ctx, stock.get("sector", ""))
+        corr_text = format_correlation_for_prompt(symbol, peers, beta, sector_rank_info)
+        if corr_text:
+            mkt_ctx_text += "\n\n" + corr_text
+
+        # Fetch fundamental data
+        fund_data = await get_fundamentals(symbol)
+        if not fund_data:
+            fund_data = await refresh_fundamentals(symbol)
+        fund_text = format_fundamentals_for_prompt(fund_data)
+        if fund_text:
+            mkt_ctx_text += "\n\n" + fund_text
+
         analysis = await get_ai_stock_analysis(
             symbol,
             stock["name"],
             stock["sector"],
             request.analysis_type,
             technical_data=technical_data,
+            market_context=mkt_ctx_text,
         )
 
         # Persist analysis
@@ -570,6 +622,109 @@ async def generate_recommendation(symbol: str):
         raise HTTPException(status_code=500, detail=f"Failed to generate recommendation: {str(e)}")
 
 
+@api_router.post("/ai/deep-research/{symbol}")
+async def deep_research_stock(symbol: str, analysis_type: str = "hybrid"):
+    """Run multi-iteration deep research on a single stock.
+
+    3-step process: ANALYZE → VERIFY → SIGNAL.
+    Returns full reasoning chain and optional trade signal.
+    """
+    from ai_engine import deep_research
+
+    symbol = symbol.upper()
+    stock = await db.stocks.find_one({"symbol": symbol}, {"_id": 0})
+    if not stock:
+        raise HTTPException(status_code=404, detail="Stock not found")
+
+    technical_data, indicators_raw = await _get_technical_data(symbol)
+
+    mkt_ctx = await get_market_context()
+    mkt_ctx_text = format_market_context(mkt_ctx)
+
+    peers = await get_correlated_peers(symbol)
+    beta = await get_beta(symbol)
+    sector_rank_info = get_sector_rank(mkt_ctx, stock.get("sector", ""))
+    corr_text = format_correlation_for_prompt(symbol, peers, beta, sector_rank_info)
+
+    fund_data = await get_fundamentals(symbol)
+    if not fund_data:
+        fund_data = await refresh_fundamentals(symbol)
+    fund_text = format_fundamentals_for_prompt(fund_data)
+
+    # Build peer comparison text from correlated peers
+    peer_lines = []
+    for p in peers:
+        change = p.get("change_pct_1d", 0) or 0
+        peer_lines.append(f"  {p['symbol']}: corr={p['correlation']:.2f}, today={change:+.1f}%")
+    peer_text = "\n".join(peer_lines) if peer_lines else "No correlation data available"
+
+    max_val, risk_pct = await _get_risk_settings()
+
+    result = await deep_research(
+        stock_symbol=symbol,
+        stock_name=stock["name"],
+        sector=stock.get("sector", ""),
+        technical_data=technical_data,
+        indicators_raw=indicators_raw,
+        market_context=mkt_ctx_text,
+        fundamental_data=fund_text,
+        correlation_data=corr_text,
+        peer_data=peer_text,
+        max_trade_value=max_val,
+        risk_per_trade_pct=risk_pct,
+    )
+
+    # Persist the research log
+    result["id"] = str(uuid_lib.uuid4())
+    await db.research_logs.insert_one({**result, "_type": "deep_research"})
+
+    # If a signal was generated, persist to analysis_history and trade_recommendations
+    mode = _current_trade_mode()
+    if result.get("signal"):
+        sig = result["signal"]
+        analysis_doc = {
+            "id": str(uuid_lib.uuid4()),
+            "stock_symbol": symbol,
+            "analysis": result.get("full_analysis", "")[:2000],
+            "confidence_score": sig.get("confidence_score", 0),
+            "analysis_type": analysis_type,
+            "trade_horizon": sig.get("trade_horizon"),
+            "key_signals": {
+                "action": sig["action"],
+                "target_price": sig.get("target_price"),
+                "stop_loss": sig.get("stop_loss"),
+                "confidence_breakdown": sig.get("confidence_breakdown", {}),
+                **(sig.get("key_signals", {})),
+            },
+            "mode": "entry",
+            "source": "deep_research",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.analysis_history.insert_one(analysis_doc)
+
+        if sig["action"] in ("BUY", "SHORT"):
+            trade_rec = TradeRecommendation(
+                stock_symbol=symbol,
+                stock_name=stock["name"],
+                sector=stock.get("sector", ""),
+                action=sig["action"],
+                quantity=sig.get("quantity", 1),
+                target_price=sig["target_price"],
+                current_price=sig["current_price"],
+                stop_loss=sig.get("stop_loss"),
+                ai_reasoning=sig.get("ai_reasoning", "")[:500],
+                confidence_score=sig["confidence_score"],
+                trade_horizon=sig.get("trade_horizon", "short_term"),
+                horizon_rationale=sig.get("horizon_rationale"),
+                key_signals=sig.get("key_signals", {}),
+                product_type=sig.get("product_type", "DELIVERY"),
+                trade_mode=mode,
+            )
+            await db.trade_recommendations.insert_one(trade_rec.model_dump())
+
+    return result
+
+
 SCAN_ALL_MAX_CANDIDATES = 15
 
 
@@ -619,6 +774,10 @@ async def scan_all_stocks():
     analyzed = 0
     scan_time = datetime.now(timezone.utc).isoformat()
 
+    # Fetch market context once for all candidates
+    mkt_ctx = await get_market_context()
+    mkt_ctx_text = format_market_context(mkt_ctx)
+
     for candidate in top_buys + top_shorts:
         sym = candidate["symbol"]
         stock = stocks_map.get(sym)
@@ -637,6 +796,7 @@ async def scan_all_stocks():
                 indicators_raw=indicators_raw,
                 max_trade_value=max_val,
                 risk_per_trade_pct=risk_pct,
+                market_context=mkt_ctx_text,
             )
 
             action = recommendation["action"] if recommendation else "HOLD"
@@ -699,6 +859,97 @@ async def scan_all_stocks():
     }
 
 
+# ============ MARKET CONTEXT ROUTES ============
+@api_router.get("/market/context")
+async def get_market_context_api():
+    """Get current market context — indices, VIX, sector rotation, advance/decline, FII/DII."""
+    ctx = await get_market_context()
+    return ctx
+
+
+@api_router.post("/market/compute-correlations")
+async def compute_correlations_api():
+    """Trigger correlation matrix computation across the stock universe."""
+    from correlation import compute_correlations
+    result = await compute_correlations()
+    return {"message": "Correlation computation complete", **result}
+
+
+@api_router.get("/market/correlation/{symbol}")
+async def get_correlation_api(symbol: str):
+    """Get correlation data for a specific stock."""
+    peers = await get_correlated_peers(symbol.upper())
+    beta = await get_beta(symbol.upper())
+    return {"symbol": symbol.upper(), "peers": peers, "beta_nifty": beta}
+
+
+# ============ DYNAMIC UNIVERSE ROUTES ============
+@api_router.get("/universe/full")
+async def get_full_universe_api():
+    """Get the full stock universe — core + active dynamic stocks."""
+    from stock_discovery import get_full_universe
+    stocks = await get_full_universe()
+    return {"stocks": stocks, "total": len(stocks)}
+
+
+@api_router.get("/universe/dynamic")
+async def get_dynamic_stocks_api():
+    """Get only dynamic watchlist stocks."""
+    from stock_discovery import get_dynamic_stocks
+    stocks = await get_dynamic_stocks()
+    return stocks
+
+
+@api_router.post("/universe/discover")
+async def discover_stock_api(symbol: str, name: str = "", sector: str = "Unknown", reason: str = "manual"):
+    """Manually add a stock to the dynamic watchlist."""
+    from stock_discovery import discover_stock
+    result = await discover_stock(symbol, name=name, sector=sector, discovered_by="user", reason=reason)
+    return result
+
+
+@api_router.delete("/universe/dynamic/{symbol}")
+async def remove_dynamic_stock_api(symbol: str):
+    """Remove a stock from the dynamic watchlist."""
+    from stock_discovery import remove_stock
+    removed = await remove_stock(symbol)
+    return {"removed": removed, "symbol": symbol.upper()}
+
+
+# ============ PAIRS TRADING ROUTES ============
+@api_router.post("/pairs/identify")
+async def identify_pairs_api():
+    """Trigger pair identification from correlation data."""
+    from pairs_engine import identify_stable_pairs
+    pairs = await identify_stable_pairs()
+    return {"message": f"Identified {len(pairs)} stable pairs", "pairs": pairs}
+
+
+@api_router.get("/pairs")
+async def get_pairs_api():
+    """Get all stable pairs currently tracked."""
+    from pairs_engine import get_all_stable_pairs
+    pairs = await get_all_stable_pairs()
+    return pairs
+
+
+@api_router.post("/pairs/scan-signals")
+async def scan_pairs_signals_api():
+    """Scan pairs for entry/exit signals based on current z-scores."""
+    from pairs_engine import scan_pairs_for_signals
+    signals = await scan_pairs_for_signals()
+    return {"signals": signals, "count": len(signals)}
+
+
+@api_router.get("/pairs/trades")
+async def get_pair_trades_api():
+    """Get open pair trades for the current mode."""
+    from pairs_engine import get_open_pair_trades
+    mode = _current_trade_mode()
+    trades = await get_open_pair_trades(trade_mode=mode)
+    return trades
+
+
 # ============ TRADE RECOMMENDATIONS ROUTES ============
 @api_router.get("/recommendations")
 async def get_recommendations(status: Optional[str] = None, action: Optional[str] = None):
@@ -744,7 +995,7 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
         if approval.modified_quantity:
             update_data["quantity"] = approval.modified_quantity
         if approval.modified_price:
-            update_data["target_price"] = approval.modified_price
+            update_data["limit_price"] = approval.modified_price
         
         await db.trade_recommendations.update_one(
             {"id": rec_id},
@@ -754,12 +1005,12 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
         # If approved, execute the trade
         if approval.approved:
             quantity = approval.modified_quantity or rec["quantity"]
-            price = approval.modified_price or rec["target_price"]
+            limit_price = approval.modified_price or rec.get("current_price") or rec["target_price"]
 
             # Pre-trade fund check in live mode
             mode = _current_trade_mode()
-            if mode == "live" and rec["action"] in ("BUY", "SHORT"):
-                trade_value = quantity * price
+            if mode == "live" and rec["action"] in ("BUY", "SHORT", "COVER"):
+                trade_value = quantity * limit_price
                 funds = await upstox_client.get_funds_and_margin()
                 if funds:
                     available = float(funds.get("available_margin", 0))
@@ -771,22 +1022,39 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
                 else:
                     logger.warning("Could not verify funds — proceeding with order anyway")
 
-            # SHORT trades: send as SELL with product=I (Intraday) to Upstox
             upstox_action = rec["action"]
             product = rec.get("product_type", "DELIVERY")
             upstox_product = "I" if product == "INTRADAY" else "D"
             if rec["action"] == "SHORT":
                 upstox_action = "SELL"
                 upstox_product = "I"
+            elif rec["action"] == "COVER":
+                upstox_action = "BUY"
+                upstox_product = "I"
 
             order_result = await upstox_client.place_order(
                 rec["stock_symbol"],
                 upstox_action,
                 quantity,
-                price,
+                limit_price,
                 product_type=upstox_product,
             )
-            
+
+            if not order_result.get("success", False):
+                error_msg = order_result.get("error", "Unknown order error")
+                await db.trade_recommendations.update_one(
+                    {"id": rec_id},
+                    {"$set": {
+                        "status": "failed",
+                        "error": error_msg,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    }}
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Order failed at broker: {error_msg}. Recommendation marked as failed. No portfolio changes made."
+                )
+
             trade_mode = order_result.get("trade_mode", "simulated")
             
             await db.trade_recommendations.update_one(
@@ -795,17 +1063,33 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
                     "status": "executed",
                     "trade_mode": trade_mode,
                     "executed_at": datetime.now(timezone.utc).isoformat(),
-                    "executed_price": price
+                    "executed_price": limit_price,
                 }}
             )
             
+            trade_pnl = None
+            if rec["action"] in ("SELL", "COVER"):
+                exit_query = {"stock_symbol": rec["stock_symbol"], "trade_mode": trade_mode}
+                if rec["action"] == "COVER":
+                    exit_query["is_short"] = True
+                else:
+                    exit_query["is_short"] = {"$ne": True}
+                held = await db.portfolio.find_one(exit_query, {"_id": 0})
+                if held:
+                    entry = held.get("avg_buy_price", 0)
+                    if rec["action"] == "COVER":
+                        trade_pnl = round((entry - limit_price) * quantity, 2)
+                    else:
+                        trade_pnl = round((limit_price - entry) * quantity, 2)
+
             trade_history = TradeHistory(
                 stock_symbol=rec["stock_symbol"],
                 stock_name=rec["stock_name"],
                 action=rec["action"],
                 quantity=quantity,
-                price=price,
-                total_value=quantity * price,
+                price=limit_price,
+                total_value=quantity * limit_price,
+                pnl=trade_pnl,
                 status="executed",
                 trade_mode=trade_mode,
                 order_id=order_result.get("order_id"),
@@ -819,7 +1103,7 @@ async def approve_recommendation(rec_id: str, approval: TradeApproval):
                 sector = stock_doc.get("sector", "Unknown") if stock_doc else "Unknown"
 
             await update_portfolio(
-                rec["stock_symbol"], rec["stock_name"], rec["action"], quantity, price,
+                rec["stock_symbol"], rec["stock_name"], rec["action"], quantity, limit_price,
                 sector,
                 trade_mode=trade_mode,
                 trade_horizon=rec.get("trade_horizon"),
@@ -884,6 +1168,8 @@ async def _get_upstox_portfolio() -> dict:
             "day_change_percentage": h.get("day_change_percentage", 0),
             "sector": sector_map.get(our_sym, "Unknown"),
             "product_type": "CNC",
+            "action": "BUY",
+            "is_short": False,
             "trade_mode": "live",
             "source": "upstox",
         })
@@ -896,27 +1182,39 @@ async def _get_upstox_portfolio() -> dict:
         our_sym = ts_to_our.get(upstox_sym, upstox_sym)
         buy_price = float(p.get("buy_price", 0) or p.get("average_price", 0))
         ltp = float(p.get("last_price", 0))
-        invested = buy_price * abs(qty)
-        current = ltp * abs(qty)
+        abs_qty = abs(qty)
+        invested = buy_price * abs_qty
+        current = ltp * abs_qty
+
+        # Negative qty in Upstox means short position
+        is_short = qty < 0
+        if is_short:
+            pnl = invested - current
+        else:
+            pnl = current - invested
+        pnl_pct = (pnl / invested * 100) if invested > 0 else 0
+
         holdings.append({
             "stock_symbol": our_sym,
             "stock_name": our_sym,
-            "quantity": qty,
+            "quantity": abs_qty,
             "avg_buy_price": round(buy_price, 2),
             "current_price": round(ltp, 2),
             "invested_value": round(invested, 2),
             "current_value": round(current, 2),
-            "pnl": round(float(p.get("pnl", current - invested)), 2),
-            "pnl_percent": round((current - invested) / invested * 100, 2) if invested > 0 else 0,
+            "pnl": round(float(p.get("pnl", pnl)), 2),
+            "pnl_percent": round(pnl_pct, 2),
             "sector": sector_map.get(our_sym, "Unknown"),
             "product_type": "INTRADAY" if p.get("product") == "I" else "CNC",
+            "action": "SHORT" if is_short else "BUY",
+            "is_short": is_short,
             "trade_mode": "live",
             "source": "upstox",
         })
 
     total_invested = sum(h["invested_value"] for h in holdings)
     total_current = sum(h["current_value"] for h in holdings)
-    total_pnl = total_current - total_invested
+    total_pnl = sum(h["pnl"] for h in holdings)
     return {
         "holdings": holdings,
         "summary": {
@@ -959,7 +1257,7 @@ async def get_portfolio():
 
     total_invested = sum(h.get("invested_value", 0) for h in holdings)
     total_current = sum(h.get("current_value", 0) for h in holdings)
-    total_pnl = total_current - total_invested
+    total_pnl = sum(h.get("pnl", 0) for h in holdings)
     total_pnl_percent = (total_pnl / total_invested * 100) if total_invested > 0 else 0
 
     return {
@@ -1077,7 +1375,10 @@ async def refresh_portfolio_prices():
             qty = h["quantity"]
             invested = h.get("invested_value", 0)
             current_val = qty * ltp
-            pnl = current_val - invested
+            if h.get("is_short", False):
+                pnl = invested - current_val
+            else:
+                pnl = current_val - invested
             pnl_pct = (pnl / invested * 100) if invested > 0 else 0.0
 
             await db.portfolio.update_one(
@@ -1113,16 +1414,33 @@ async def sell_holding(symbol: str, quantity: Optional[int] = None):
         quotes = await upstox_client.get_batch_quotes([symbol.upper()])
         price = float(quotes.get(symbol.upper(), {}).get("ltp", 0))
 
-    order_result = await upstox_client.place_order(symbol.upper(), "SELL", sell_qty, price)
+    # Short positions: cover with BUY order; Long positions: exit with SELL
+    is_short = holding.get("is_short", False) or holding.get("action") == "SHORT"
+    upstox_action = "BUY" if is_short else "SELL"
+    exit_action = "COVER" if is_short else "SELL"
+
+    order_result = await upstox_client.place_order(symbol.upper(), upstox_action, sell_qty, price)
+    if not order_result.get("success", False):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Order failed at broker: {order_result.get('error', 'Unknown')}. No changes made."
+        )
     trade_mode = order_result.get("trade_mode", "simulated")
+
+    entry_price = holding.get("avg_buy_price", 0)
+    if is_short:
+        trade_pnl = round((entry_price - price) * sell_qty, 2)
+    else:
+        trade_pnl = round((price - entry_price) * sell_qty, 2)
 
     trade = TradeHistory(
         stock_symbol=symbol.upper(),
         stock_name=holding.get("stock_name", symbol.upper()),
-        action="SELL",
+        action=exit_action,
         quantity=sell_qty,
         price=price,
         total_value=round(sell_qty * price, 2),
+        pnl=trade_pnl,
         status="executed",
         order_id=order_result.get("order_id", "MANUAL"),
         trade_mode=trade_mode,
@@ -1131,7 +1449,7 @@ async def sell_holding(symbol: str, quantity: Optional[int] = None):
     await update_portfolio(
         symbol=symbol.upper(),
         name=holding.get("stock_name", symbol.upper()),
-        action="SELL",
+        action=exit_action,
         quantity=sell_qty,
         price=price,
         sector=holding.get("sector", ""),
@@ -1176,16 +1494,47 @@ async def scan_portfolio_for_sells():
             h["current_price"] = float(quotes[sym]["ltp"])
             h["current_value"] = h["quantity"] * h["current_price"]
 
+    # Fetch market context once for all holdings
+    mkt_ctx = await get_market_context()
+    mkt_ctx_text = format_market_context(mkt_ctx)
+
     signals = []
     sell_count = 0
 
     for holding in holdings:
+        sym = holding["stock_symbol"]
         try:
-            technical_data, _ = await _get_technical_data(holding["stock_symbol"])
+            technical_data, _ = await _get_technical_data(sym)
+
+            # Enrich with market context, correlation, and fundamentals
+            peers = await get_correlated_peers(sym)
+            beta = await get_beta(sym)
+            corr_text = format_correlation_for_prompt(sym, peers, beta)
+
+            fund_data = await get_fundamentals(sym)
+            fund_text = format_fundamentals_for_prompt(fund_data)
+
+            enriched_data = technical_data
+            if mkt_ctx_text:
+                enriched_data += f"\n\n{mkt_ctx_text}"
+            if corr_text:
+                enriched_data += f"\n\n{corr_text}"
+            if fund_text:
+                enriched_data += f"\n\n{fund_text}"
+
+            # Warn about correlated peer collapses
+            bearish_peers = [p for p in peers if (p.get("change_pct_1d") or 0) < -2 and p.get("correlation", 0) > 0.7]
+            if bearish_peers:
+                names = ", ".join(f"{p['symbol']} ({p['change_pct_1d']:+.1f}%)" for p in bearish_peers)
+                enriched_data += f"\n\n⚠️ CORRELATED PEERS FALLING: {names}. Warning sign for {sym}."
+
+            from fundamentals import is_near_earnings
+            if await is_near_earnings(sym, days=3):
+                enriched_data += f"\n\n⚠️ EARNINGS IMMINENT: {sym} reports results within 3 days."
 
             signal = await generate_portfolio_sell_signal(
                 holding,
-                technical_data=technical_data,
+                technical_data=enriched_data,
             )
 
             if signal:
@@ -1194,11 +1543,13 @@ async def scan_portfolio_for_sells():
                 if signal["action"] == "SELL" and signal.get("sell_quantity", 0) > 0:
                     sell_count += 1
                     sell_qty = min(signal["sell_quantity"], holding["quantity"])
+                    is_short = holding.get("is_short", False) or holding.get("action") == "SHORT"
+                    exit_action = "COVER" if is_short else "SELL"
                     trade_rec = TradeRecommendation(
                         stock_symbol=signal["stock_symbol"],
                         stock_name=signal["stock_name"],
                         sector=holding.get("sector", ""),
-                        action="SELL",
+                        action=exit_action,
                         quantity=sell_qty,
                         target_price=holding.get("current_price", 0),
                         current_price=holding.get("current_price", 0),
@@ -1211,11 +1562,23 @@ async def scan_portfolio_for_sells():
                     )
                     await db.trade_recommendations.insert_one(trade_rec.model_dump())
 
+                # If AI says HOLD but revised the levels, update the portfolio
+                elif signal["action"] == "HOLD" and mode != "live":
+                    updates = {}
+                    if signal.get("revised_stop_loss"):
+                        updates["stop_loss"] = float(signal["revised_stop_loss"])
+                    if signal.get("revised_target"):
+                        updates["target_price"] = float(signal["revised_target"])
+                    if updates:
+                        await db.portfolio.update_one(
+                            {"stock_symbol": sym, "trade_mode": mode}, {"$set": updates}
+                        )
+
             await asyncio.sleep(2)
         except Exception as e:
-            logger.error(f"Error scanning {holding['stock_symbol']}: {e}")
+            logger.error(f"Error scanning {sym}: {e}")
             signals.append({
-                "stock_symbol": holding["stock_symbol"],
+                "stock_symbol": sym,
                 "action": "ERROR",
                 "reasoning": str(e),
             })
@@ -1449,8 +1812,8 @@ async def get_dashboard_stats():
     return {
         "portfolio_value": round(total_current, 2),
         "total_invested": round(total_invested, 2),
-        "total_pnl": round(total_current - total_invested, 2),
-        "pnl_percent": round((total_current - total_invested) / total_invested * 100, 2) if total_invested > 0 else 0,
+        "total_pnl": round(sum(h.get("pnl", 0) for h in portfolio), 2),
+        "pnl_percent": round(sum(h.get("pnl", 0) for h in portfolio) / total_invested * 100, 2) if total_invested > 0 else 0,
         "available_margin": round(available_margin, 2),
         "pending_recommendations": pending_count,
         "today_trades": today_trades,
@@ -1466,13 +1829,24 @@ async def update_portfolio(
     trade_mode: str = "simulated", trade_horizon: str = None, target_price: float = None,
     stop_loss: float = None, recommendation_id: str = None,
 ):
-    """Update portfolio after a trade, preserving trade context for sell signal generation.
-    Queries are scoped by trade_mode so the same stock can exist in both live and sandbox portfolios.
+    """Update portfolio after a trade execution.
+
+    Handles all 4 trade actions:
+      BUY   — open or add to a long position
+      SHORT — open a short position (sell first, buy back later)
+      SELL  — close/reduce a long position
+      COVER — close/reduce a short position (buy to cover)
     """
-    query = {"stock_symbol": symbol, "trade_mode": trade_mode}
-    existing = await db.portfolio.find_one(query, {"_id": 0})
-    
+    base_query = {"stock_symbol": symbol, "trade_mode": trade_mode}
+    long_query = {**base_query, "is_short": {"$ne": True}}
+    short_query = {**base_query, "is_short": True}
+
     if action == "BUY":
+        existing_short = await db.portfolio.find_one(short_query, {"_id": 0})
+        if existing_short:
+            logger.warning(f"Cannot BUY {symbol}: active SHORT position exists. Cover the short first.")
+            return
+        existing = await db.portfolio.find_one(long_query, {"_id": 0})
         if existing:
             new_qty = existing["quantity"] + quantity
             new_invested = existing["invested_value"] + (quantity * price)
@@ -1494,7 +1868,7 @@ async def update_portfolio(
                 update_fields["stop_loss"] = stop_loss
             if recommendation_id:
                 update_fields["ai_recommendation_id"] = recommendation_id
-            await db.portfolio.update_one(query, {"$set": update_fields})
+            await db.portfolio.update_one(long_query, {"$set": update_fields})
         else:
             portfolio = Portfolio(
                 stock_symbol=symbol,
@@ -1507,6 +1881,9 @@ async def update_portfolio(
                 pnl=0.0,
                 pnl_percent=0.0,
                 sector=sector,
+                action="BUY",
+                product_type="DELIVERY",
+                is_short=False,
                 trade_mode=trade_mode,
                 trade_horizon=trade_horizon,
                 target_price=target_price,
@@ -1515,15 +1892,72 @@ async def update_portfolio(
                 ai_recommendation_id=recommendation_id,
             )
             await db.portfolio.insert_one(portfolio.model_dump())
-    
-    elif action == "SELL" and existing:
+
+    elif action == "SHORT":
+        existing_long = await db.portfolio.find_one(long_query, {"_id": 0})
+        if existing_long:
+            logger.warning(f"Cannot SHORT {symbol}: active LONG position exists. Sell the long first.")
+            return
+        existing_short = await db.portfolio.find_one(short_query, {"_id": 0})
+        if existing_short:
+            logger.warning(f"Duplicate SHORT rejected for {symbol}: already have a short position.")
+            return
+        portfolio = Portfolio(
+            stock_symbol=symbol,
+            stock_name=name,
+            quantity=quantity,
+            avg_buy_price=price,
+            current_price=price,
+            invested_value=quantity * price,
+            current_value=quantity * price,
+            pnl=0.0,
+            pnl_percent=0.0,
+            sector=sector,
+            action="SHORT",
+            product_type="INTRADAY",
+            is_short=True,
+            trade_mode=trade_mode,
+            trade_horizon=trade_horizon or "short_term",
+            target_price=target_price,
+            stop_loss=stop_loss,
+            bought_at=datetime.now(timezone.utc).isoformat(),
+            ai_recommendation_id=recommendation_id,
+        )
+        await db.portfolio.insert_one(portfolio.model_dump())
+
+    elif action == "SELL":
+        existing = await db.portfolio.find_one(long_query, {"_id": 0})
+        if not existing:
+            logger.warning(f"Cannot SELL {symbol}: no long position found.")
+            return
         new_qty = existing["quantity"] - quantity
         if new_qty <= 0:
-            await db.portfolio.delete_one(query)
+            await db.portfolio.delete_one(long_query)
         else:
             new_invested = new_qty * existing["avg_buy_price"]
             await db.portfolio.update_one(
-                query,
+                long_query,
+                {"$set": {
+                    "quantity": new_qty,
+                    "invested_value": new_invested,
+                    "current_price": price,
+                    "current_value": new_qty * price,
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }}
+            )
+
+    elif action == "COVER":
+        existing = await db.portfolio.find_one(short_query, {"_id": 0})
+        if not existing:
+            logger.warning(f"Cannot COVER {symbol}: no short position found.")
+            return
+        new_qty = existing["quantity"] - quantity
+        if new_qty <= 0:
+            await db.portfolio.delete_one(short_query)
+        else:
+            new_invested = new_qty * existing["avg_buy_price"]
+            await db.portfolio.update_one(
+                short_query,
                 {"$set": {
                     "quantity": new_qty,
                     "invested_value": new_invested,

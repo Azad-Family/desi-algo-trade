@@ -457,6 +457,8 @@ export default function AIResearch() {
   const [searchTerm, setSearchTerm] = useState("");
   const [analysis, setAnalysis] = useState(null);
   const [analyzing, setAnalyzing] = useState(false);
+  const [deepResearching, setDeepResearching] = useState(false);
+  const [correlationData, setCorrelationData] = useState(null);
   const [scanningAll, setScanningAll] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [viewTab, setViewTab] = useState("hybrid");
@@ -556,6 +558,64 @@ export default function AIResearch() {
       setAnalyzing(false);
     }
   };
+
+  const runDeepResearch = async () => {
+    if (!selectedStock) {
+      toast.error("Please select a stock first");
+      return;
+    }
+    setDeepResearching(true);
+    setAnalysis(null);
+    toast.info("Deep research started — 3-step AI analysis (this takes ~2 minutes)");
+
+    try {
+      const res = await axios.post(`${API}/ai/deep-research/${selectedStock.symbol}`, null, { timeout: 300000 });
+      const data = res.data;
+      if (data.full_analysis) {
+        setAnalysis({
+          stock_symbol: selectedStock.symbol,
+          analysis: data.full_analysis,
+          confidence_score: data.final_confidence || 0,
+          key_signals: data.signal ? {
+            action: data.signal.action,
+            target_price: data.signal.target_price,
+            stop_loss: data.signal.stop_loss,
+            ...(data.signal.confidence_breakdown || {}),
+            ...(data.signal.key_signals || {}),
+          } : {},
+          source: "deep_research",
+          created_at: data.completed_at,
+          steps: data.steps,
+        });
+        fetchHistory();
+        if (data.signal) {
+          toast.success(`Deep research complete — ${data.signal.action} signal generated (confidence: ${data.final_confidence})`);
+        } else {
+          toast.info(`Deep research complete — no actionable signal (confidence: ${data.final_confidence})`);
+        }
+      }
+    } catch (error) {
+      console.error("Deep research failed:", error);
+      toast.error("Deep research failed — check backend logs");
+    } finally {
+      setDeepResearching(false);
+    }
+  };
+
+  const fetchCorrelation = async (symbol) => {
+    try {
+      const res = await axios.get(`${API}/market/correlation/${symbol}`);
+      setCorrelationData(res.data);
+    } catch {
+      setCorrelationData(null);
+    }
+  };
+
+  useEffect(() => {
+    if (selectedStock?.symbol) {
+      fetchCorrelation(selectedStock.symbol);
+    }
+  }, [selectedStock?.symbol]);
 
   const scanAllStocks = async () => {
     setScanningAll(true);
@@ -782,8 +842,14 @@ export default function AIResearch() {
                           </span>
                         </div>
                         <div className="flex items-center justify-between mt-0.5">
-                          <span className="text-muted-foreground/70">
-                            {item.mode || item.analysis_type || "hybrid"}
+                          <span className="text-muted-foreground/70 text-[10px]">
+                            {item.source === "auto_scan" ? "🤖 Auto Scan"
+                              : item.source === "deep_exit_scan" ? "🔍 Exit Scan"
+                              : item.source === "intraday_exit_scan" ? "⏱ Intraday Exit"
+                              : item.source === "scan_all" ? "📊 Scan All"
+                              : item.source === "deep_research" ? "🧠 Deep Research"
+                              : item.mode === "exit" ? "🔍 Exit"
+                              : item.mode || item.analysis_type || "hybrid"}
                           </span>
                           <span className="text-muted-foreground/50">{timeAgo(item.created_at)}</span>
                         </div>
@@ -811,24 +877,45 @@ export default function AIResearch() {
                   )}
                 </div>
                 {selectedStock && (
-                  <Button
-                    onClick={runAnalysis}
-                    disabled={analyzing}
-                    size="sm"
-                    className="bg-ai-glow hover:bg-ai-glow/80 text-white"
-                  >
-                    {analyzing ? (
-                      <>
-                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                        Analyzing...
-                      </>
-                    ) : (
-                      <>
-                        <Brain className="w-4 h-4 mr-2" />
-                        Analyze
-                      </>
-                    )}
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button
+                      onClick={runAnalysis}
+                      disabled={analyzing || deepResearching}
+                      size="sm"
+                      className="bg-ai-glow hover:bg-ai-glow/80 text-white"
+                    >
+                      {analyzing ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          Analyzing...
+                        </>
+                      ) : (
+                        <>
+                          <Brain className="w-4 h-4 mr-2" />
+                          Quick Analyze
+                        </>
+                      )}
+                    </Button>
+                    <Button
+                      onClick={runDeepResearch}
+                      disabled={analyzing || deepResearching}
+                      size="sm"
+                      variant="outline"
+                      className="border-purple-500/50 text-purple-400 hover:bg-purple-500/10"
+                    >
+                      {deepResearching ? (
+                        <>
+                          <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                          Deep Research...
+                        </>
+                      ) : (
+                        <>
+                          <Layers className="w-4 h-4 mr-2" />
+                          Deep Research
+                        </>
+                      )}
+                    </Button>
+                  </div>
                 )}
               </div>
             </CardHeader>
@@ -935,6 +1022,64 @@ export default function AIResearch() {
                               ))}
                           </div>
                         )}
+
+                      {/* Correlation Peers */}
+                      {correlationData && correlationData.peers && correlationData.peers.length > 0 && (
+                        <div className="p-3 rounded-lg bg-surface-secondary border border-border-subtle">
+                          <h4 className="text-xs font-semibold text-muted-foreground mb-2 flex items-center gap-1.5">
+                            <Activity className="w-3.5 h-3.5" />
+                            CORRELATED PEERS
+                            {correlationData.beta_nifty && (
+                              <span className="ml-auto text-[10px] font-normal">
+                                Beta vs Nifty: {correlationData.beta_nifty.toFixed(2)}
+                              </span>
+                            )}
+                          </h4>
+                          <div className="grid grid-cols-2 gap-2">
+                            {correlationData.peers.slice(0, 4).map((p) => (
+                              <div key={p.symbol} className="flex items-center justify-between text-xs px-2 py-1 rounded bg-surface-primary border border-border-subtle">
+                                <span className="font-medium">{p.symbol}</span>
+                                <span className="text-muted-foreground">corr: {p.correlation?.toFixed(2)}</span>
+                                <span className={`font-semibold ${
+                                  (p.change_pct_1d || 0) > 0 ? "text-signal-success" : (p.change_pct_1d || 0) < 0 ? "text-signal-danger" : "text-muted-foreground"
+                                }`}>
+                                  {(p.change_pct_1d || 0) > 0 ? "+" : ""}{(p.change_pct_1d || 0).toFixed(1)}%
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Deep Research Steps */}
+                      {analysis?.steps && analysis.steps.length > 0 && (
+                        <div className="p-3 rounded-lg bg-surface-secondary border border-purple-500/20">
+                          <h4 className="text-xs font-semibold text-purple-400 mb-2 flex items-center gap-1.5">
+                            <Layers className="w-3.5 h-3.5" />
+                            DEEP RESEARCH STEPS
+                          </h4>
+                          <div className="space-y-1.5">
+                            {analysis.steps.map((step, i) => (
+                              <div key={i} className="flex items-center gap-2 text-xs">
+                                <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                                  step.error ? "bg-red-500/20 text-red-400" :
+                                  step.skipped ? "bg-yellow-500/20 text-yellow-400" :
+                                  "bg-signal-success/20 text-signal-success"
+                                }`}>{i + 1}</span>
+                                <span className="font-medium">{step.step}</span>
+                                {step.confidence && (
+                                  <span className="text-muted-foreground">
+                                    confidence: {step.confidence}
+                                  </span>
+                                )}
+                                {step.skipped && <span className="text-yellow-400">(skipped: {step.reason})</span>}
+                                {step.error && <span className="text-red-400">(failed)</span>}
+                                {step.proceed_to_signal === false && <span className="text-yellow-400">(verification rejected)</span>}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
 
                       <Separator className="bg-border-subtle" />
 

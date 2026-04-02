@@ -307,19 +307,21 @@ class UpstoxClient:
         return []
 
     async def place_order(self, symbol: str, action: str, quantity: int, price: float,
-                          product_type: str = "D") -> Dict[str, Any]:
+                          product_type: str = "D",
+                          order_type: str = "MARKET") -> Dict[str, Any]:
         """Place an order through Upstox.
 
         Args:
-            product_type: "D" for Delivery, "I" for Intraday (used for SHORT trades).
-            action: "BUY" or "SELL". For SHORT trades, caller should pass action="SELL"
-                    with product_type="I".
+            product_type: "D" for Delivery, "I" for Intraday.
+            action: "BUY" or "SELL".
+            order_type: "MARKET" or "LIMIT". MARKET is default for approvals.
+            price: Required for LIMIT orders; ignored for MARKET.
 
-        Returns dict with at least: order_id, status, trade_mode.
-        trade_mode is one of: "live", "sandbox", "simulated".
+        Returns dict with at least: order_id, status, trade_mode, success.
         """
         if not self.order_access_token:
             return {
+                "success": True,
                 "status": "simulated",
                 "order_id": f"SIM-{uuid_lib.uuid4().hex[:8].upper()}",
                 "trade_mode": "simulated",
@@ -336,13 +338,17 @@ class UpstoxClient:
                     "Content-Type": "application/json",
                     "Accept": "application/json"
                 }
+                effective_order_type = order_type.upper() if order_type else "MARKET"
+                if effective_order_type not in ("MARKET", "LIMIT"):
+                    effective_order_type = "MARKET"
+
                 order_data = {
                     "quantity": quantity,
                     "product": product_type,
                     "validity": "DAY",
-                    "price": price,
+                    "price": price if effective_order_type == "LIMIT" else 0,
                     "instrument_token": instrument_key,
-                    "order_type": "LIMIT",
+                    "order_type": effective_order_type,
                     "transaction_type": action,
                     "disclosed_quantity": 0,
                     "trigger_price": 0,
@@ -356,13 +362,27 @@ class UpstoxClient:
                 if response.status_code == 200:
                     result = response.json()
                     result["trade_mode"] = mode
+                    result["success"] = True
                     return result
                 else:
                     logger.warning(f"Upstox order returned {response.status_code}: {response.text[:300]}")
+                    return {
+                        "success": False,
+                        "status": "failed",
+                        "error": f"Upstox returned {response.status_code}",
+                        "trade_mode": mode,
+                    }
         except Exception as e:
             logger.error(f"Upstox order error: {e}")
+            return {
+                "success": False,
+                "status": "failed",
+                "error": str(e),
+                "trade_mode": mode,
+            }
 
         return {
+            "success": False,
             "status": "simulated",
             "order_id": f"SIM-{uuid_lib.uuid4().hex[:8].upper()}",
             "trade_mode": "simulated",

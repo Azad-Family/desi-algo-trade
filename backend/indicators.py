@@ -458,10 +458,19 @@ def compute_signal_scorecard(indicators: Dict[str, Any]) -> Dict[str, Any]:
     if obv_sig:
         add("obv", "bullish" if obv_sig == "accumulation" else "bearish")
 
-    # 13. ADX trend strength
+    # 13. ADX trend strength (magnitude only — not directional)
     adx = indicators.get("adx_14")
     if adx is not None:
-        add("trend_strength", "bullish" if adx > 25 else "neutral")
+        di_plus = indicators.get("di_plus")
+        di_minus = indicators.get("di_minus")
+        if adx > 25:
+            if di_plus is not None and di_minus is not None:
+                direction = "bullish" if di_plus > di_minus else "bearish"
+                add("trend_strength", direction)
+            else:
+                add("trend_strength", "strong")
+        else:
+            add("trend_strength", "weak")
 
     # 14. Candle pattern
     cp = indicators.get("candle_pattern")
@@ -615,10 +624,12 @@ def format_indicators_for_prompt(indicators: Dict[str, Any]) -> str:
         lines.append(f"CPR Interpretation: {'WIDE (trending day likely)' if cpr_w > 0.5 else 'NARROW (range-bound day likely — breakout potential)'}")
 
     # --- Fibonacci ---
-    if indicators.get("swing_high"):
+    fib_sh = indicators.get("fib_swing_high") or indicators.get("swing_high")
+    fib_sl = indicators.get("fib_swing_low") or indicators.get("swing_low")
+    if fib_sh:
         lines.append("")
         lines.append("=== FIBONACCI RETRACEMENT (50-day swing) ===")
-        lines.append(f"Swing: Rs.{indicators.get('swing_low')} – Rs.{indicators.get('swing_high')}")
+        lines.append(f"Swing: Rs.{fib_sl} – Rs.{fib_sh}")
         lines.append(f"23.6%={indicators.get('fib_236')} | 38.2%={indicators.get('fib_382')} | 50%={indicators.get('fib_500')} | 61.8%={indicators.get('fib_618')} | 78.6%={indicators.get('fib_786')}")
 
     # --- Moving Averages ---
@@ -744,4 +755,181 @@ def format_technical_numbers_for_ai(indicators: Dict[str, Any]) -> str:
         mt = constraints.get("medium_term", {})
         lines.append(f"short_term_SL={st.get('stop_loss_range')} short_term_target={st.get('target_range')}")
         lines.append(f"medium_term_SL={mt.get('stop_loss_range')} medium_term_target={mt.get('target_range')}")
+    return "\n".join(lines)
+
+
+# ─── Intraday-specific indicators (from 15-min / hourly candles) ─────────
+
+def compute_intraday_indicators(candles: list) -> Optional[Dict[str, Any]]:
+    """Compute intraday-specific indicators from sub-daily candles (15-min or hourly).
+
+    Requires fewer bars than daily indicators (minimum 5 candles).
+    Returns VWAP, intraday RSI, intraday momentum, session stats, and micro-trend.
+    """
+    if not candles or len(candles) < 5:
+        logger.warning(f"Insufficient intraday candles: {len(candles) if candles else 0}")
+        return None
+
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    try:
+        result = {}
+        latest = df.iloc[-1]
+
+        # VWAP (Volume Weighted Average Price)
+        df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
+        df["tp_x_vol"] = df["typical_price"] * df["volume"]
+        cumulative_tpv = df["tp_x_vol"].cumsum()
+        cumulative_vol = df["volume"].cumsum()
+        df["vwap"] = cumulative_tpv / cumulative_vol.replace(0, 1)
+        vwap = round(float(df["vwap"].iloc[-1]), 2)
+        result["vwap"] = vwap
+        result["price_vs_vwap"] = "above" if float(latest["close"]) > vwap else "below"
+        result["vwap_distance_pct"] = round(
+            (float(latest["close"]) - vwap) / vwap * 100, 2
+        ) if vwap > 0 else 0
+
+        # Session high/low/open
+        session_high = round(float(df["high"].max()), 2)
+        session_low = round(float(df["low"].min()), 2)
+        session_open = round(float(df["open"].iloc[0]), 2)
+        session_close = round(float(latest["close"]), 2)
+        result["session_high"] = session_high
+        result["session_low"] = session_low
+        result["session_open"] = session_open
+        result["session_close"] = session_close
+        result["session_range"] = round(session_high - session_low, 2)
+        result["session_change_pct"] = round(
+            (session_close - session_open) / session_open * 100, 2
+        ) if session_open > 0 else 0
+
+        # Position within session range
+        range_size = session_high - session_low
+        if range_size > 0:
+            result["session_position_pct"] = round(
+                (session_close - session_low) / range_size * 100, 1
+            )
+        else:
+            result["session_position_pct"] = 50.0
+
+        # Intraday RSI (on 15-min candles)
+        if len(df) >= 14:
+            rsi = ta.rsi(df["close"], length=14)
+            if rsi is not None and len(rsi) > 0:
+                rsi_val = float(rsi.iloc[-1]) if pd.notna(rsi.iloc[-1]) else None
+                if rsi_val is not None:
+                    result["intraday_rsi"] = round(rsi_val, 1)
+                    if rsi_val >= 70:
+                        result["intraday_rsi_signal"] = "overbought"
+                    elif rsi_val <= 30:
+                        result["intraday_rsi_signal"] = "oversold"
+                    else:
+                        result["intraday_rsi_signal"] = "neutral"
+
+        # Short EMA crossover (5/13 on intraday candles)
+        if len(df) >= 13:
+            ema5 = ta.ema(df["close"], length=5)
+            ema13 = ta.ema(df["close"], length=13)
+            if ema5 is not None and ema13 is not None:
+                e5 = float(ema5.iloc[-1]) if pd.notna(ema5.iloc[-1]) else None
+                e13 = float(ema13.iloc[-1]) if pd.notna(ema13.iloc[-1]) else None
+                if e5 is not None and e13 is not None:
+                    result["intraday_ema_5"] = round(e5, 2)
+                    result["intraday_ema_13"] = round(e13, 2)
+                    result["intraday_ema_cross"] = "bullish" if e5 > e13 else "bearish"
+
+        # Intraday MACD (fast settings: 8, 17, 9)
+        if len(df) >= 20:
+            macd_df = ta.macd(df["close"], fast=8, slow=17, signal=9)
+            if macd_df is not None and not macd_df.empty:
+                macd_line = macd_df.iloc[-1].get("MACD_8_17_9")
+                signal_line = macd_df.iloc[-1].get("MACDs_8_17_9")
+                if pd.notna(macd_line) and pd.notna(signal_line):
+                    result["intraday_macd"] = round(float(macd_line), 2)
+                    result["intraday_macd_signal"] = round(float(signal_line), 2)
+                    result["intraday_macd_cross"] = "bullish" if float(macd_line) > float(signal_line) else "bearish"
+
+        # Volume trend (comparing recent bars to session average)
+        total_vol = df["volume"].sum()
+        n_bars = len(df)
+        avg_vol = total_vol / n_bars if n_bars > 0 else 0
+        recent_vol = df["volume"].tail(3).mean() if len(df) >= 3 else avg_vol
+        result["intraday_total_volume"] = int(total_vol)
+        result["intraday_avg_bar_volume"] = int(avg_vol)
+        result["intraday_volume_trend"] = "rising" if recent_vol > avg_vol * 1.3 else (
+            "falling" if recent_vol < avg_vol * 0.7 else "stable"
+        )
+
+        # Momentum: rate of change over last 4 bars
+        if len(df) >= 5:
+            roc = (float(latest["close"]) - float(df["close"].iloc[-5])) / float(df["close"].iloc[-5]) * 100
+            result["intraday_momentum_4bar"] = round(roc, 2)
+            result["intraday_momentum_dir"] = "accelerating_up" if roc > 0.3 else (
+                "accelerating_down" if roc < -0.3 else "flat"
+            )
+
+        # Micro-trend: last 3 candles direction
+        if len(df) >= 3:
+            last3 = df.tail(3)
+            ups = sum(1 for _, r in last3.iterrows() if r["close"] > r["open"])
+            result["micro_trend"] = "bullish" if ups >= 2 else ("bearish" if ups == 0 else "mixed")
+
+        logger.info(f"Computed {len(result)} intraday indicators")
+        return result
+
+    except Exception as e:
+        logger.error(f"Intraday indicator computation failed: {e}")
+        return None
+
+
+def format_intraday_for_prompt(indicators: Dict[str, Any]) -> str:
+    """Format intraday indicators into a text block for AI prompt injection."""
+    if not indicators:
+        return ""
+
+    lines = [
+        "=== INTRADAY SESSION DATA (15-min candles — current trading session) ===",
+        f"Session: Open={indicators.get('session_open')} High={indicators.get('session_high')} "
+        f"Low={indicators.get('session_low')} Current={indicators.get('session_close')}",
+        f"Session Change: {indicators.get('session_change_pct', 0):+.2f}% | "
+        f"Range: Rs.{indicators.get('session_range', 0)} | "
+        f"Position in Range: {indicators.get('session_position_pct', 50)}%",
+        f"VWAP: Rs.{indicators.get('vwap')} | Price vs VWAP: {indicators.get('price_vs_vwap', 'N/A')} "
+        f"({indicators.get('vwap_distance_pct', 0):+.2f}%)",
+    ]
+
+    if indicators.get("intraday_rsi") is not None:
+        lines.append(
+            f"Intraday RSI(14): {indicators['intraday_rsi']} [{indicators.get('intraday_rsi_signal', 'N/A')}]"
+        )
+
+    if indicators.get("intraday_ema_cross"):
+        lines.append(
+            f"Intraday EMA 5/13: {indicators.get('intraday_ema_5')}/{indicators.get('intraday_ema_13')} "
+            f"[{indicators['intraday_ema_cross']}]"
+        )
+
+    if indicators.get("intraday_macd") is not None:
+        lines.append(
+            f"Intraday MACD(8,17,9): {indicators['intraday_macd']} / Signal: {indicators.get('intraday_macd_signal')} "
+            f"[{indicators.get('intraday_macd_cross', 'N/A')}]"
+        )
+
+    lines.append(
+        f"Volume: Total={indicators.get('intraday_total_volume', 0):,} | "
+        f"Avg/bar={indicators.get('intraday_avg_bar_volume', 0):,} | "
+        f"Trend: {indicators.get('intraday_volume_trend', 'N/A')}"
+    )
+
+    if indicators.get("intraday_momentum_4bar") is not None:
+        lines.append(
+            f"Momentum (4-bar): {indicators['intraday_momentum_4bar']:+.2f}% "
+            f"[{indicators.get('intraday_momentum_dir', 'N/A')}]"
+        )
+
+    if indicators.get("micro_trend"):
+        lines.append(f"Micro-trend (last 3 candles): {indicators['micro_trend']}")
+
     return "\n".join(lines)

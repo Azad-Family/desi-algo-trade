@@ -8,9 +8,14 @@ and appends them — avoiding a full re-download every day.
 Schema: { symbol, candles, last_candle_date }
   - candles: list of [timestamp, open, high, low, close, volume, oi]
   - last_candle_date: "YYYY-MM-DD" of the most recent candle in the cache
+
+Multi-timeframe support:
+  - get_weekly_candles(): aggregates daily candles into weekly bars
+  - get_intraday_candles(): fetches 15-min candles for current day (not cached)
 """
 import logging
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -111,3 +116,83 @@ async def get_candles(symbol: str, db, upstox_client) -> list:
         )
         logger.info(f"Cached {len(candles)} candles for {symbol} (up to {last_date})")
     return candles or []
+
+
+# ─── Weekly candles (aggregated from daily) ──────────────────
+
+def aggregate_weekly(daily_candles: list) -> list:
+    """Aggregate daily candles into weekly OHLCV bars.
+
+    Groups by ISO week number. Returns list in same format:
+    [week_start_date, open, high, low, close, volume, oi]
+    """
+    if not daily_candles:
+        return []
+
+    import pandas as pd
+
+    df = pd.DataFrame(daily_candles, columns=["ts", "open", "high", "low", "close", "volume", "oi"])
+    df["ts"] = pd.to_datetime(df["ts"])
+    df = df.sort_values("ts")
+
+    df["week"] = df["ts"].dt.isocalendar().week.astype(int)
+    df["year"] = df["ts"].dt.isocalendar().year.astype(int)
+
+    weekly = df.groupby(["year", "week"]).agg(
+        ts=("ts", "first"),
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        oi=("oi", "last"),
+    ).reset_index(drop=True)
+
+    weekly = weekly.sort_values("ts")
+    result = []
+    for _, row in weekly.iterrows():
+        result.append([
+            row["ts"].isoformat(),
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+            int(row["volume"]),
+            int(row["oi"]) if not pd.isna(row["oi"]) else 0,
+        ])
+    return result
+
+
+async def get_weekly_candles(symbol: str, db, upstox_client) -> list:
+    """Return weekly candles for a symbol, aggregated from cached daily data."""
+    daily = await get_candles(symbol, db, upstox_client)
+    return aggregate_weekly(daily)
+
+
+# ─── Intraday candles (not cached — fetched live) ───────────
+
+async def get_intraday_candles(
+    symbol: str,
+    upstox_client,
+    interval: int = 15,
+) -> list:
+    """Fetch intraday candles (default 15-min) for today from Upstox.
+
+    These are NOT cached — always fetched fresh for current-day analysis.
+    Used for entry timing and momentum reversal detection.
+    """
+    today = _today_ist()
+    try:
+        candles = await upstox_client.get_historical_candles(
+            symbol,
+            unit="minutes",
+            interval=interval,
+            from_date=today,
+            to_date=today,
+        )
+        if candles:
+            logger.info(f"Fetched {len(candles)} intraday {interval}m candles for {symbol}")
+        return candles or []
+    except Exception as e:
+        logger.warning(f"Could not fetch intraday candles for {symbol}: {e}")
+        return []

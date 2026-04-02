@@ -30,6 +30,7 @@ def build_analysis_prompt(
     sector: str,
     analysis_type: str,
     technical_data: str = "",
+    market_context: str = "",
 ) -> str:
     data_block = ""
     if technical_data:
@@ -37,8 +38,12 @@ def build_analysis_prompt(
             "\n=== REAL MARKET DATA (computed from Upstox historical candles — these are GROUND TRUTH) ===\n"
             f"{technical_data}\n"
         )
+    context_block = ""
+    if market_context:
+        context_block = f"\n{market_context}\n"
 
     return f"""{SYSTEM_PROMPT}
+{context_block}
 
 Analyze {stock_name} ({stock_symbol}) from the {sector} sector on NSE.
 Analysis Type: {analysis_type.upper()}
@@ -115,6 +120,7 @@ def build_trade_signal_prompt(
     technical_data: str = "",
     max_trade_value: float = 100000.0,
     risk_per_trade_pct: float = 2.0,
+    market_context: str = "",
 ) -> str:
     data_block = ""
     if technical_data:
@@ -124,6 +130,10 @@ def build_trade_signal_prompt(
             f"{technical_data}\n"
         )
 
+    context_block = ""
+    if market_context:
+        context_block = f"\n{market_context}\n"
+
     risk_block = (
         f"\n=== RISK PARAMETERS ===\n"
         f"Max trade value: Rs.{max_trade_value:,.0f}\n"
@@ -131,6 +141,7 @@ def build_trade_signal_prompt(
     )
 
     return f"""You are a disciplined algorithmic trading system for Indian NSE stocks.
+{context_block}
 You generate precise, data-driven trade signals. You NEVER guess prices — you use the
 REAL TECHNICAL DATA provided below as ground truth for current price, indicators, and
 signal scorecard.
@@ -192,22 +203,35 @@ def build_sell_signal_prompt(
             f"{technical_data}\n"
         )
 
-    return f"""You are a disciplined algorithmic trading system evaluating whether to SELL \
-an existing portfolio holding. This is NOT a general analysis — you must decide based on \
+    return f"""You are a disciplined algorithmic trading system evaluating whether to EXIT \
+an existing portfolio position. This is NOT a general analysis — you must decide based on \
 the position context, the SIGNAL SCORECARD, and whether the trade horizon has been exhausted.
+
+IMPORTANT: The position may be either a LONG (BUY) or SHORT (SELL) position.
+- For LONG positions: you PROFIT when price RISES. Exit means SELLING.
+- For SHORT positions: you PROFIT when price DROPS. Exit means BUYING TO COVER.
+  For shorts: stop-loss is ABOVE entry (price rising = loss), target is BELOW entry (price dropping = profit).
+  A bearish scorecard is GOOD for shorts (confirms your thesis). A bullish scorecard is BAD (price moving against you).
 
 {position_block}
 {tech_block}
 
-HARD RULES (follow in order):
+HARD RULES FOR LONG (BUY) POSITIONS (follow in order):
 1. STOP-LOSS HIT (current price <= stop-loss) → action=SELL, urgency=immediate, sell_quantity=ALL
 2. TARGET HIT (current price >= target) → action=SELL, urgency=immediate, sell_quantity=ALL \
    (unless SIGNAL SCORECARD is strongly bullish AND momentum is accelerating — then HOLD with revised target)
-3. TRADE HORIZON EXPIRED:
-   - Short-term held >14 days → action=SELL unless P&L > +5% and scorecard is bullish
-   - Medium-term held >90 days → action=SELL unless fundamentals improved materially
+3. SIGNAL SCORECARD is BEARISH → strong bias toward SELL
+
+HARD RULES FOR SHORT POSITIONS (follow in order):
+1. STOP-LOSS HIT (current price >= stop-loss, price rising against you) → action=SELL, urgency=immediate, sell_quantity=ALL
+2. TARGET HIT (current price <= target, price dropped to your profit target) → action=SELL, urgency=immediate, sell_quantity=ALL
+3. SIGNAL SCORECARD is BULLISH (price likely to rise = bad for shorts) → strong bias toward SELL (cover the short)
+
+COMMON RULES (apply to both):
+4. TRADE HORIZON EXPIRED:
+   - Short-term held >14 days → action=SELL unless P&L > +5%
+   - Medium-term held >90 days → action=SELL unless thesis still intact
    - Long-term held >365 days → reassess; SELL if thesis is broken
-4. SIGNAL SCORECARD is BEARISH (majority bearish signals) → strong bias toward SELL
 5. P&L worse than -10% → evaluate if thesis is broken; SELL if no catalyst for recovery
 6. If none of the above apply → action=HOLD with tighter revised_stop_loss
 
@@ -217,10 +241,10 @@ Respond with ONLY valid JSON (no markdown, no text outside JSON):
 {{
     "action": "SELL" or "HOLD",
     "urgency": "immediate" or "soon" or "monitor",
-    "reasoning": "3-4 sentences: reference specific signal scorecard results, P&L, horizon status, and any news",
+    "reasoning": "3-4 sentences: reference specific signal scorecard results, P&L, horizon status, and any news. For SHORT positions, clarify if price movement is for or against the trade.",
     "revised_target": <new target price if HOLD, null if SELL>,
     "revised_stop_loss": <tighter stop-loss if HOLD, null if SELL>,
-    "sell_quantity": <number of shares to sell, {qty} for full exit, 0 if HOLD>,
+    "sell_quantity": <number of shares to sell/cover, {qty} for full exit, 0 if HOLD>,
     "confidence": <0-100>,
     "horizon_assessment": "1-2 sentences on whether original trade thesis is intact and horizon status",
     "key_signals": {{
@@ -333,3 +357,157 @@ User question: {message}
 
 Provide a clear, actionable answer. If it relates to a specific stock, include current data.
 Keep it under 300 words. Use **bold** for key points."""
+
+
+# ---------------------------------------------------------------------------
+# Deep Research — Step 1: ANALYZE (initial assessment)
+# ---------------------------------------------------------------------------
+
+def build_deep_analyze_prompt(
+    stock_symbol: str,
+    stock_name: str,
+    sector: str,
+    technical_data: str,
+    market_context: str,
+    fundamental_data: str,
+    correlation_data: str,
+) -> str:
+    return f"""{SYSTEM_PROMPT}
+
+{market_context}
+
+Analyze {stock_name} ({stock_symbol}) from the {sector} sector on NSE.
+
+=== REAL TECHNICAL DATA ===
+{technical_data}
+
+{fundamental_data}
+
+{correlation_data}
+
+TASK: Provide your INITIAL assessment. Be thorough but also identify gaps:
+
+1. **INITIAL VERDICT**: [BULLISH / BEARISH / NEUTRAL]
+2. **TECHNICAL SUMMARY**: Key indicator readings and what they suggest (3-4 bullets)
+3. **FUNDAMENTAL SUMMARY**: Key fundamental factors (2-3 bullets)
+4. **CORRELATION CONTEXT**: What are correlated peers doing? Confirming or diverging?
+5. **MARKET REGIME FIT**: Does the current market regime support this trade?
+6. **QUESTIONS / GAPS**: What additional information would change your verdict?
+   List 2-3 specific questions you need answered (e.g., "Has there been any M&A news?",
+   "What is the FII holding trend?", "Is the sector rotation favoring or against?")
+7. **PRELIMINARY CONFIDENCE**: ___/100
+
+Use Google Search to find the LATEST news about {stock_symbol}.
+Respond in structured markdown with clear headers."""
+
+
+# ---------------------------------------------------------------------------
+# Deep Research — Step 2: VERIFY (devil's advocate + peer comparison)
+# ---------------------------------------------------------------------------
+
+def build_deep_verify_prompt(
+    stock_symbol: str,
+    stock_name: str,
+    initial_analysis: str,
+    peer_data: str,
+    market_context: str,
+) -> str:
+    return f"""You are a SKEPTICAL senior risk manager reviewing a junior analyst's recommendation.
+Your job is to find flaws, challenge assumptions, and stress-test the thesis.
+
+JUNIOR ANALYST'S INITIAL ASSESSMENT:
+{initial_analysis}
+
+MARKET CONTEXT:
+{market_context}
+
+PEER COMPARISON DATA:
+{peer_data}
+
+YOUR TASKS:
+
+1. **DEVIL'S ADVOCATE**: Argue the OPPOSITE case from the analyst's verdict.
+   - If they said BULLISH, present the strongest bear case.
+   - If they said BEARISH, present the strongest bull case.
+   - Reference specific data points that contradict the analyst.
+
+2. **PEER CHECK**: Are the top correlated peers confirming or diverging from
+   {stock_symbol}'s setup? If peers are moving opposite, explain why that's a warning.
+
+3. **REGIME CHECK**: Does the analyst's recommendation align with the current
+   market regime? A BUY in a STRONG_BEAR regime needs extra justification.
+
+4. **RISK ASSESSMENT**: What are the top 3 risks the analyst may have overlooked?
+   - Macro risks (rate cycle, global events)
+   - Sector-specific risks
+   - Stock-specific risks (earnings, corp governance, liquidity)
+
+5. **REVISED VERDICT**: After your stress-test:
+   - Did the original thesis survive? [YES / PARTIALLY / NO]
+   - Revised confidence: ___/100 (typically lower than initial)
+   - Should we proceed to generate a trade signal? [YES / NO]
+   - If YES, any modifications to the trade parameters?
+
+Be brutally honest. This is real money. Respond in structured markdown."""
+
+
+# ---------------------------------------------------------------------------
+# Deep Research — Step 3: SIGNAL (precise trade signal with confidence)
+# ---------------------------------------------------------------------------
+
+def build_deep_signal_prompt(
+    stock_symbol: str,
+    stock_name: str,
+    sector: str,
+    current_price: float,
+    initial_analysis: str,
+    verification: str,
+    technical_data: str,
+    max_trade_value: float,
+    risk_per_trade_pct: float,
+) -> str:
+    return f"""You are the FINAL decision layer of an algorithmic trading system.
+Two analyses have been conducted — an initial assessment and a verification review.
+Your job is to synthesize both into a PRECISE trade signal.
+
+INITIAL ANALYSIS:
+{initial_analysis}
+
+VERIFICATION REVIEW:
+{verification}
+
+REAL TECHNICAL DATA:
+{technical_data}
+
+RULES:
+1. current_price is Rs.{current_price:.2f} — use this exactly.
+2. For BUY: target > current_price, stop_loss < current_price.
+3. For SHORT: target < current_price, stop_loss > current_price. SHORT is intraday only.
+4. If verification said NO to proceeding, output HOLD.
+5. Confidence must reflect BOTH the initial analysis AND the verification stress-test.
+6. Provide structured confidence breakdown.
+
+RESPOND WITH ONLY VALID JSON (no markdown, no explanation):
+{{
+    "action": "BUY" | "SHORT" | "HOLD",
+    "current_price": {current_price},
+    "target_price": <number>,
+    "stop_loss": <number>,
+    "product_type": "DELIVERY" | "INTRADAY",
+    "trade_horizon": "short_term" | "medium_term" | "long_term",
+    "horizon_rationale": "<why this horizon>",
+    "reasoning": "<2-3 sentence synthesis of both analyses>",
+    "confidence": <0-100>,
+    "confidence_breakdown": {{
+        "technical": <0-100>,
+        "fundamental": <0-100>,
+        "sentiment": <0-100>,
+        "timing": <0-100>
+    }},
+    "risk_reward_ratio": "<X:1>",
+    "key_signals": {{
+        "primary_signal": "<e.g. EMA crossover bullish>",
+        "confirming_signals": ["<signal1>", "<signal2>"],
+        "warning_signals": ["<risk1>", "<risk2>"]
+    }}
+}}"""

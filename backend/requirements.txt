@@ -27,6 +27,11 @@ google-genai
 # Technical Analysis
 pandas
 pandas-ta
+numpy
+
+# Fundamental Data (NSE/BSE corporate actions, earnings)
+india-corp-actions
+beautifulsoup4
 
 # Trading Integration
 upstox-python-sdk==2.19.0

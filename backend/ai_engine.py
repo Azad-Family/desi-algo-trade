@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_PRIORITY = ["gemini-3-flash-preview", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite-preview"]
+
+# Pro model for critical analysis steps (deep research analyze + verify)
+PRO_MODEL = "gemini-2.5-pro"
+# Fast model for routing, chat, signal generation
+FAST_MODEL = "gemini-2.5-flash"
 MODEL_COOLDOWN_SECONDS = 60
 
 
@@ -166,7 +171,29 @@ def _call_gemini(client, prompt: str, config, max_retries: int = 4):
     raise RuntimeError(f"All Gemini models rate-limited ({models_tried}). Last error: {errors[-1][1]}")
 
 
-from prompts import build_analysis_prompt, build_trade_signal_prompt, build_sell_signal_prompt
+from prompts import (
+    build_analysis_prompt, build_trade_signal_prompt, build_sell_signal_prompt,
+    build_deep_analyze_prompt, build_deep_verify_prompt, build_deep_signal_prompt,
+)
+
+
+def _call_gemini_model(client, prompt: str, config, model: str = None, fallback: bool = True):
+    """Call Gemini with a specific model. Falls back to priority list on error."""
+    target_model = model or _model_mgr.get_model()
+    try:
+        logger.info(f"Gemini call → model={target_model}")
+        response = client.models.generate_content(
+            model=target_model,
+            contents=prompt,
+            config=config,
+        )
+        return response
+    except Exception as e:
+        if fallback and _is_retryable_error(e):
+            logger.warning(f"Model {target_model} failed ({e}), falling back to priority list")
+            _model_mgr.mark_rate_limited(target_model)
+            return _call_gemini(client, prompt, config)
+        raise
 
 
 async def get_ai_stock_analysis(
@@ -174,7 +201,8 @@ async def get_ai_stock_analysis(
     stock_name: str,
     sector: str,
     analysis_type: str = "hybrid",
-    technical_data: str = None
+    technical_data: str = None,
+    market_context: str = "",
 ) -> Dict[str, Any]:
     """Analyze a stock using Gemini AI with real market data and search grounding.
 
@@ -194,7 +222,8 @@ async def get_ai_stock_analysis(
         from google.genai.types import GenerateContentConfig, GoogleSearch, Tool
 
         analysis_prompt = build_analysis_prompt(
-            stock_symbol, stock_name, sector, analysis_type, technical_data or "",
+            stock_symbol, stock_name, sector, analysis_type,
+            technical_data or "", market_context=market_context,
         )
 
         config = GenerateContentConfig(
@@ -282,23 +311,31 @@ def _validate_recommendation(data: dict, current_price: float) -> Optional[str]:
         return None  # can't validate without a price
 
     if action == "BUY":
-        if target and target <= current_price:
+        if not target or target <= 0:
+            return f"BUY signal missing target price"
+        if not stop or stop <= 0:
+            return f"BUY signal missing stop-loss"
+        if target <= current_price:
             return f"BUY target ({target}) must be above current price ({current_price})"
-        if stop and stop >= current_price:
+        if stop >= current_price:
             return f"BUY stop-loss ({stop}) must be below current price ({current_price})"
-        if target and stop and target <= stop:
+        if target <= stop:
             return f"target ({target}) must be above stop-loss ({stop})"
-        if target and (target / current_price) > 2.0:
+        if (target / current_price) > 2.0:
             return f"target ({target}) is >100% above current price — unrealistic"
-        if stop and (stop / current_price) < 0.5:
+        if (stop / current_price) < 0.5:
             return f"stop-loss ({stop}) is >50% below current price — unrealistic"
 
     if action in ("SELL", "SHORT"):
-        if target and target >= current_price:
+        if not target or target <= 0:
+            return f"{action} signal missing target price"
+        if not stop or stop <= 0:
+            return f"{action} signal missing stop-loss"
+        if target >= current_price:
             return f"{action} target ({target}) must be below current price ({current_price})"
-        if stop and stop <= current_price:
+        if stop <= current_price:
             return f"{action} stop-loss ({stop}) must be above current price ({current_price})"
-        if target and stop and target >= stop:
+        if target >= stop:
             return f"{action} target ({target}) must be below stop-loss ({stop})"
 
     conf = data.get("confidence", 0)
@@ -310,18 +347,24 @@ def _validate_recommendation(data: dict, current_price: float) -> Optional[str]:
 
 def _compute_quantity(current_price: float, max_trade_value: float,
                       risk_pct: float, stop_loss: float) -> int:
-    """Calculate position size from risk parameters."""
+    """Calculate position size from risk parameters.
+
+    Returns 0 if even 1 share would exceed max_trade_value.
+    """
     if current_price <= 0:
-        return 1
-    # Method 1: max trade value
-    qty_by_value = int(max_trade_value / current_price) if current_price else 1
-    # Method 2: risk-based sizing (risk only risk_pct of max_trade_value per trade)
-    if stop_loss and stop_loss > 0 and current_price > stop_loss:
-        risk_per_share = current_price - stop_loss
-        risk_budget = max_trade_value * (risk_pct / 100.0)
-        qty_by_risk = int(risk_budget / risk_per_share) if risk_per_share > 0 else qty_by_value
-        return max(1, min(qty_by_value, qty_by_risk))
-    return max(1, min(qty_by_value, 50))
+        return 0
+    qty_by_value = int(max_trade_value / current_price)
+    if qty_by_value <= 0:
+        return 0
+
+    if stop_loss and stop_loss > 0:
+        risk_per_share = abs(current_price - stop_loss)
+        if risk_per_share > 0:
+            risk_budget = max_trade_value * (risk_pct / 100.0)
+            qty_by_risk = int(risk_budget / risk_per_share)
+            return max(1, min(qty_by_value, qty_by_risk)) if qty_by_risk > 0 else 0
+
+    return qty_by_value
 
 
 async def generate_trade_recommendation(
@@ -332,6 +375,7 @@ async def generate_trade_recommendation(
     indicators_raw: Dict[str, Any] = None,
     max_trade_value: float = 100000.0,
     risk_per_trade_pct: float = 2.0,
+    market_context: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Generate a structured trade recommendation with trade horizon.
 
@@ -340,6 +384,7 @@ async def generate_trade_recommendation(
         indicators_raw: Raw indicator dict for server-side validation.
         max_trade_value: Max capital to deploy per trade (from Settings).
         risk_per_trade_pct: Max % of trade value to risk (from Settings).
+        market_context: Formatted market context text block.
     """
     client = _get_gemini_client()
     if not client:
@@ -354,6 +399,7 @@ async def generate_trade_recommendation(
         prompt = build_trade_signal_prompt(
             stock_symbol, stock_name, sector, current_price,
             technical_data or "", max_trade_value, risk_per_trade_pct,
+            market_context=market_context,
         )
 
         config = GenerateContentConfig(
@@ -395,16 +441,19 @@ async def generate_trade_recommendation(
         stop_loss_val = float(data.get("stop_loss", 0)) if data.get("stop_loss") else None
 
         action = data["action"]
-        # For SHORT: risk_per_share = stop_loss - current_price (upward risk)
         if action == "SHORT" and stop_loss_val and stop_loss_val > effective_price:
             risk_per_share = stop_loss_val - effective_price
             risk_budget = max_trade_value * (risk_per_trade_pct / 100.0)
-            qty_by_value = int(max_trade_value / effective_price) if effective_price else 1
+            qty_by_value = int(max_trade_value / effective_price) if effective_price else 0
             qty_by_risk = int(risk_budget / risk_per_share) if risk_per_share > 0 else qty_by_value
-            quantity = max(1, min(qty_by_value, qty_by_risk))
+            quantity = min(qty_by_value, qty_by_risk) if qty_by_value > 0 else 0
         else:
             quantity = _compute_quantity(effective_price, max_trade_value,
                                         risk_per_trade_pct, stop_loss_val or 0)
+
+        if quantity <= 0:
+            logger.warning(f"Skipping {stock_symbol}: computed quantity=0 (price={effective_price}, max_trade_value={max_trade_value})")
+            return None
 
         product_type = "INTRADAY" if action == "SHORT" else data.get("product_type", "DELIVERY")
 
@@ -477,7 +526,12 @@ async def generate_portfolio_sell_signal(
     current = holding.get("current_price", avg_buy)
     invested = holding.get("invested_value", avg_buy * qty)
     current_value = holding.get("current_value", current * qty)
-    pnl = current_value - invested
+    is_short = holding.get("is_short", False) or holding.get("action") == "SHORT"
+
+    if is_short:
+        pnl = invested - current_value
+    else:
+        pnl = current_value - invested
     pnl_pct = (pnl / invested * 100) if invested > 0 else 0
 
     trade_horizon = holding.get("trade_horizon", "medium_term")
@@ -491,27 +545,40 @@ async def generate_portfolio_sell_signal(
     horizon_remaining = max(horizon_max_days - days_held, 0)
     horizon_expired = days_held > horizon_max_days
 
+    # For SHORT: target is below entry (price should drop), SL is above entry (price goes up = loss)
+    if is_short:
+        target_hit = "YES" if target_price and current <= target_price else ("NO" if target_price else "N/A")
+        sl_hit = "YES" if stop_loss and current >= stop_loss else ("NO" if stop_loss else "N/A")
+    else:
+        target_hit = "YES" if target_price and current >= target_price else ("NO" if target_price else "N/A")
+        sl_hit = "YES" if stop_loss and current <= stop_loss else ("NO" if stop_loss else "N/A")
+
     try:
         from google.genai.types import GenerateContentConfig, GoogleSearch, Tool
 
+        position_type = "SHORT SELL" if is_short else "BUY (LONG)"
+        entry_label = "Short Entry Price" if is_short else "Buy Price"
+
         position_block = f"""
-=== YOUR POSITION ===
+=== YOUR POSITION ({position_type}) ===
 Stock: {name} ({symbol}) — {sector}
+Position Type: {position_type}
 Quantity: {qty} shares
-Buy Price: Rs.{avg_buy:.2f}
+{entry_label}: Rs.{avg_buy:.2f}
 Current Price: Rs.{current:.2f}
-Invested: Rs.{invested:.2f}
+{"Exposure" if is_short else "Invested"}: Rs.{invested:.2f}
 Current Value: Rs.{current_value:.2f}
 Unrealized P&L: Rs.{pnl:.2f} ({pnl_pct:+.2f}%)
+{"⚠️ SHORT POSITION: You PROFIT when price DROPS, you LOSE when price RISES." if is_short else ""}
 
 === TRADE PLAN ===
 Original Trade Horizon: {horizon_label} ({horizon_max_days} days)
 Days Held: {days_held}
 Horizon Remaining: {horizon_remaining} days {"** EXPIRED **" if horizon_expired else ""}
-Original Target Price: {"Rs." + f"{target_price:.2f}" if target_price else "Not set"}
-Original Stop-Loss: {"Rs." + f"{stop_loss:.2f}" if stop_loss else "Not set"}
-Target Hit: {"YES" if target_price and current >= target_price else "NO" if target_price else "N/A"}
-Stop-Loss Hit: {"YES" if stop_loss and current <= stop_loss else "NO" if stop_loss else "N/A"}
+Original Target Price: {"Rs." + f"{target_price:.2f}" if target_price else "Not set"} {"(below entry — price should drop)" if is_short and target_price else ""}
+Original Stop-Loss: {"Rs." + f"{stop_loss:.2f}" if stop_loss else "Not set"} {"(above entry — exit if price rises)" if is_short and stop_loss else ""}
+Target Hit: {target_hit}
+Stop-Loss Hit: {sl_hit}
 """
 
         prompt = build_sell_signal_prompt(
@@ -555,3 +622,225 @@ Stop-Loss Hit: {"YES" if stop_loss and current <= stop_loss else "NO" if stop_lo
         logger.error(f"Portfolio sell signal error for {symbol}: {e}")
 
     return None
+
+
+# ─── Deep Research (multi-iteration) ────────────────────────
+
+# Confidence thresholds for gating
+MIN_CONFIDENCE_TO_TRADE = 70
+MIN_CONFIDENCE_FOR_LIVE = 80
+
+
+async def deep_research(
+    stock_symbol: str,
+    stock_name: str,
+    sector: str,
+    technical_data: str = "",
+    indicators_raw: Dict[str, Any] = None,
+    market_context: str = "",
+    fundamental_data: str = "",
+    correlation_data: str = "",
+    peer_data: str = "",
+    max_trade_value: float = 100000.0,
+    risk_per_trade_pct: float = 2.0,
+    use_pro_model: bool = False,
+) -> Dict[str, Any]:
+    """Multi-iteration deep research: ANALYZE → VERIFY → SIGNAL.
+
+    Unlike one-shot analysis, this runs 3 Gemini calls per stock:
+    1. Initial assessment with all available data
+    2. Devil's advocate verification that challenges the thesis
+    3. Final signal generation (only if verification approves)
+
+    Returns a ResearchResult dict with the full reasoning chain,
+    structured confidence breakdown, and optional trade signal.
+    """
+    client = _get_gemini_client()
+    if not client:
+        return {"error": "Gemini not configured", "steps": []}
+
+    from google.genai.types import GenerateContentConfig, GoogleSearch, Tool
+
+    current_price = indicators_raw.get("current_price", 0) if indicators_raw else 0
+    research_log = {
+        "symbol": stock_symbol,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "steps": [],
+        "signal": None,
+    }
+
+    # Model selection: use Pro for analysis/verification if requested
+    analysis_model = PRO_MODEL if use_pro_model else None
+    signal_model = FAST_MODEL  # Signal generation is structured, flash is fine
+
+    # ─── Step 1: ANALYZE ─────────────────────────────────────
+    logger.info(f"Deep research [{stock_symbol}] Step 1: ANALYZE (model: {analysis_model or 'default'})")
+    try:
+        analyze_prompt = build_deep_analyze_prompt(
+            stock_symbol, stock_name, sector,
+            technical_data, market_context,
+            fundamental_data, correlation_data,
+        )
+        config_analyze = GenerateContentConfig(
+            tools=[Tool(google_search=GoogleSearch())],
+            temperature=0.4,
+        )
+        resp1 = _call_gemini_model(client, analyze_prompt, config_analyze, model=analysis_model)
+        initial_analysis = resp1.text
+
+        # Parse preliminary confidence
+        conf_match = re.search(r'confidence[:\s]*(\d+)', initial_analysis.lower())
+        step1_confidence = int(conf_match.group(1)) if conf_match else 50
+
+        research_log["steps"].append({
+            "step": "ANALYZE",
+            "output_preview": initial_analysis[:500],
+            "confidence": step1_confidence,
+            "model": _model_mgr.current_model(),
+        })
+        logger.info(f"Deep research [{stock_symbol}] Step 1 done — confidence: {step1_confidence}")
+    except Exception as e:
+        logger.error(f"Deep research [{stock_symbol}] Step 1 failed: {e}")
+        research_log["steps"].append({"step": "ANALYZE", "error": str(e)})
+        research_log["error"] = f"Analysis failed: {e}"
+        return research_log
+
+    # ─── Step 2: VERIFY ──────────────────────────────────────
+    logger.info(f"Deep research [{stock_symbol}] Step 2: VERIFY")
+    try:
+        verify_prompt = build_deep_verify_prompt(
+            stock_symbol, stock_name,
+            initial_analysis, peer_data, market_context,
+        )
+        config_verify = GenerateContentConfig(
+            tools=[Tool(google_search=GoogleSearch())],
+            temperature=0.5,
+        )
+        resp2 = _call_gemini_model(client, verify_prompt, config_verify, model=analysis_model)
+        verification = resp2.text
+
+        # Parse revised confidence
+        rev_conf = re.search(r'revised\s+confidence[:\s]*(\d+)', verification.lower())
+        step2_confidence = int(rev_conf.group(1)) if rev_conf else step1_confidence - 10
+
+        # Check if verification approves proceeding
+        proceed = True
+        if re.search(r'should we proceed.*?\bNO\b', verification, re.IGNORECASE):
+            proceed = False
+        if re.search(r'thesis survive.*?\bNO\b', verification, re.IGNORECASE):
+            proceed = False
+
+        research_log["steps"].append({
+            "step": "VERIFY",
+            "output_preview": verification[:500],
+            "confidence": step2_confidence,
+            "proceed_to_signal": proceed,
+            "model": _model_mgr.current_model(),
+        })
+        logger.info(f"Deep research [{stock_symbol}] Step 2 done — confidence: {step2_confidence}, proceed: {proceed}")
+    except Exception as e:
+        logger.error(f"Deep research [{stock_symbol}] Step 2 failed: {e}")
+        research_log["steps"].append({"step": "VERIFY", "error": str(e)})
+        verification = ""
+        proceed = False
+        step2_confidence = step1_confidence - 20
+
+    # ─── Step 3: SIGNAL (only if verified) ───────────────────
+    if proceed and step2_confidence >= MIN_CONFIDENCE_TO_TRADE:
+        logger.info(f"Deep research [{stock_symbol}] Step 3: SIGNAL")
+        try:
+            signal_prompt = build_deep_signal_prompt(
+                stock_symbol, stock_name, sector, current_price,
+                initial_analysis, verification,
+                technical_data, max_trade_value, risk_per_trade_pct,
+            )
+            config_signal = GenerateContentConfig(
+                tools=[Tool(google_search=GoogleSearch())],
+                temperature=0.3,
+            )
+            resp3 = _call_gemini_model(client, signal_prompt, config_signal, model=signal_model)
+            signal_text = resp3.text
+
+            # Parse JSON signal
+            json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', signal_text)
+            if json_match:
+                signal_data = json.loads(json_match.group())
+
+                # Normalize SELL → SHORT for unheld stocks
+                if signal_data.get("action") == "SELL":
+                    signal_data["action"] = "SHORT"
+                    signal_data["product_type"] = "INTRADAY"
+
+                if signal_data.get("action") != "HOLD":
+                    # Validate
+                    ai_price = float(signal_data.get("current_price", 0))
+                    eff_price = ai_price if ai_price > 0 else current_price
+                    validation_error = _validate_recommendation(signal_data, eff_price)
+
+                    if validation_error:
+                        logger.warning(f"Deep research [{stock_symbol}] signal failed validation: {validation_error}")
+                        signal_data = None
+                    else:
+                        target_price = float(signal_data.get("target_price", 0))
+                        stop_loss_val = float(signal_data.get("stop_loss", 0)) if signal_data.get("stop_loss") else None
+                        action = signal_data["action"]
+
+                        if action == "SHORT" and stop_loss_val and stop_loss_val > eff_price:
+                            risk_per_share = stop_loss_val - eff_price
+                            risk_budget = max_trade_value * (risk_per_trade_pct / 100.0)
+                            qty_by_value = int(max_trade_value / eff_price) if eff_price else 0
+                            qty_by_risk = int(risk_budget / risk_per_share) if risk_per_share > 0 else qty_by_value
+                            quantity = min(qty_by_value, qty_by_risk) if qty_by_value > 0 else 0
+                        else:
+                            quantity = _compute_quantity(eff_price, max_trade_value, risk_per_trade_pct, stop_loss_val or 0)
+
+                        if quantity <= 0:
+                            logger.warning(f"Deep research [{stock_symbol}]: quantity=0, skipping signal")
+                            signal_data = None
+                        else:
+                            product_type = "INTRADAY" if action == "SHORT" else signal_data.get("product_type", "DELIVERY")
+
+                        if signal_data:
+                            research_log["signal"] = {
+                                "stock_symbol": stock_symbol,
+                                "stock_name": stock_name,
+                                "action": action,
+                                "product_type": product_type,
+                                "trade_horizon": signal_data.get("trade_horizon", "short_term"),
+                                "horizon_rationale": signal_data.get("horizon_rationale", ""),
+                                "target_price": target_price,
+                                "current_price": eff_price,
+                                "stop_loss": stop_loss_val,
+                                "quantity": quantity,
+                                "ai_reasoning": signal_data.get("reasoning", ""),
+                                "confidence_score": float(signal_data.get("confidence", step2_confidence)),
+                                "confidence_breakdown": signal_data.get("confidence_breakdown", {}),
+                                "key_signals": signal_data.get("key_signals", {}),
+                            }
+                else:
+                    signal_data = None
+
+            research_log["steps"].append({
+                "step": "SIGNAL",
+                "signal_generated": research_log["signal"] is not None,
+                "model": _model_mgr.current_model(),
+            })
+        except Exception as e:
+            logger.error(f"Deep research [{stock_symbol}] Step 3 failed: {e}")
+            research_log["steps"].append({"step": "SIGNAL", "error": str(e)})
+    else:
+        reason = "verification rejected" if not proceed else f"confidence {step2_confidence} < {MIN_CONFIDENCE_TO_TRADE}"
+        logger.info(f"Deep research [{stock_symbol}] skipping SIGNAL — {reason}")
+        research_log["steps"].append({
+            "step": "SIGNAL",
+            "skipped": True,
+            "reason": reason,
+        })
+
+    # Final
+    research_log["completed_at"] = datetime.now(timezone.utc).isoformat()
+    research_log["final_confidence"] = step2_confidence
+    research_log["full_analysis"] = initial_analysis
+    research_log["verification"] = verification if 'verification' in dir() else ""
+
+    return research_log

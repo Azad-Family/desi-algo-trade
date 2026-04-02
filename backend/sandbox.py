@@ -55,7 +55,16 @@ async def _update_account_stats():
 
     invested = sum(h["entry_price"] * h["quantity"] for h in holdings)
     current_val = sum(h["current_price"] * h["quantity"] for h in holdings)
-    unrealized_pnl = current_val - invested
+
+    # Unrealized P&L must account for SHORT positions (profit when price drops)
+    unrealized_pnl = 0
+    for h in holdings:
+        entry_val = h["entry_price"] * h["quantity"]
+        curr_val = h["current_price"] * h["quantity"]
+        if h.get("action") == "SHORT":
+            unrealized_pnl += entry_val - curr_val
+        else:
+            unrealized_pnl += curr_val - entry_val
 
     capital = STARTING_CAPITAL + total_realized_pnl - invested
     total_pnl = total_realized_pnl + unrealized_pnl
@@ -211,7 +220,13 @@ async def execute_sandbox_exit(
     )
     await db.sandbox_trades.insert_one(trade.model_dump())
 
-    released = exit_price * qty
+    # Capital release depends on position type:
+    # LONG exit (selling shares): you receive sale proceeds = exit_price * qty
+    # SHORT cover (buying back): you release margin (entry_price * qty) and realize P&L
+    if holding["action"] == "SHORT":
+        released = (entry * qty) + pnl
+    else:
+        released = exit_price * qty
     account = await get_or_create_account()
     new_capital = account["current_capital"] + released
     await db.sandbox_account.update_one(

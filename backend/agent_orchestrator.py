@@ -929,18 +929,29 @@ async def _execute_approval(rec_id: str, approved: bool = True) -> Dict[str, Any
     quantity = rec["quantity"]
     price = rec["target_price"]
 
-    # SHORT trades: send as SELL with product=I (Intraday) to Upstox
     upstox_action = rec["action"]
     product = rec.get("product_type", "DELIVERY")
     upstox_product = "I" if product == "INTRADAY" else "D"
     if rec["action"] == "SHORT":
         upstox_action = "SELL"
         upstox_product = "I"
+    elif rec["action"] == "COVER":
+        upstox_action = "BUY"
+        upstox_product = "I"
 
     order_result = await upstox_client.place_order(
         rec["stock_symbol"], upstox_action, quantity, price,
         product_type=upstox_product,
     )
+
+    if not order_result.get("success", False):
+        error_msg = order_result.get("error", "Unknown order error")
+        await db.trade_recommendations.update_one(
+            {"id": rec_id},
+            {"$set": {"status": "failed", "error": error_msg, "updated_at": now}},
+        )
+        return rec
+
     trade_mode = order_result.get("trade_mode", "simulated")
 
     await db.trade_recommendations.update_one(
@@ -968,7 +979,6 @@ async def _execute_approval(rec_id: str, approved: bool = True) -> Dict[str, Any
     )
     await db.trade_history.insert_one(trade_history.model_dump())
 
-    # Import update_portfolio from routes
     from routes import update_portfolio
     await update_portfolio(
         rec["stock_symbol"], rec["stock_name"], rec["action"], quantity, price,
